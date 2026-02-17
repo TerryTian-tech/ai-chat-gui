@@ -101,7 +101,17 @@ python AIChat.py
 4. **多图输入**：可同时上传最多 10 张图片
 
 ## 📁 项目结构
+ai-chat-gui/
 
+├── AIChat.py # 主程序文件
+
+├── README.md # 项目说明文档
+
+├── requirements.txt # 依赖包列表
+
+└── ~/.aichat/ # 用户数据目录（自动创建）
+
+└── conversations.json # 对话历史文件
 
 ## 🛠️ 技术实现
 
