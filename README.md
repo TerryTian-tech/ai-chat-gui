@@ -48,7 +48,7 @@ cd ai-chat-gui
 ```
 2. **安装依赖**
 ```bash
-pip install openai pyside6
+pip install openai pyside6 mistune pygments
 ```
 3. **运行程序**
 ```bash
@@ -123,7 +123,7 @@ ai-chat-gui/
 
 ### 关键特性实现
 1. **流式响应**: 使用 OpenAI 的流式 API，实时更新回复内容
-2. **代码高亮**: 正则表达式解析代码块，自定义 CodeBlockWidget 渲染
+2. **代码高亮**: 解析代码块，自定义 CodeBlockWidget 渲染
 3. **多模态处理**: Base64 编码图片，根据模型支持自动调整消息格式
 4. **防抖优化**: 使用 QTimer 实现高度调整防抖，提升性能
 5. **错误处理**: 完善的异常捕获和用户友好提示

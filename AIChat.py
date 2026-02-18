@@ -19,6 +19,319 @@ import uuid
 from datetime import datetime
 import os
 
+# ==================== Markdown 解析器（使用 mistune + Pygments）====================
+# 尝试导入 mistune 和 pygments，如果不可用则使用正则表达式降级处理
+try:
+    import mistune
+    from pygments import highlight
+    from pygments.lexers import get_lexer_by_name, guess_lexer, TextLexer
+    from pygments.formatters import HtmlFormatter
+    from pygments.util import ClassNotFound
+    MARKDOWN_LIBS_AVAILABLE = True
+except ImportError:
+    MARKDOWN_LIBS_AVAILABLE = False
+    print("警告: mistune 或 pygments 未安装，将使用正则表达式解析。建议运行: pip install mistune pygments")
+
+
+class PygmentsRenderer(mistune.HTMLRenderer if MARKDOWN_LIBS_AVAILABLE else object):
+    """
+    使用 Pygments 进行代码高亮的 mistune 渲染器
+    """
+    
+    def __init__(self, style='monokai', css_class='code-highlight', *args, **kwargs):
+        if MARKDOWN_LIBS_AVAILABLE:
+            super().__init__(*args, **kwargs)
+        self.style = style
+        self.css_class = css_class
+    
+    def block_code(self, code, info=None):
+        """渲染代码块"""
+        if not code or not code.strip():
+            return ''
+        
+        if not MARKDOWN_LIBS_AVAILABLE:
+            return f'<pre><code>{code}</code></pre>'
+        
+        lexer = self._get_lexer(code, info)
+        formatter = HtmlFormatter(
+            style=self.style,
+            cssclass=self.css_class,
+            nowrap=False,
+            linenos=False
+        )
+        
+        return highlight(code, lexer, formatter)
+    
+    def _get_lexer(self, code, info):
+        """获取合适的词法分析器"""
+        if not MARKDOWN_LIBS_AVAILABLE:
+            return None
+            
+        if not info:
+            try:
+                return guess_lexer(code)
+            except ClassNotFound:
+                return TextLexer()
+        
+        # 语言别名映射
+        aliases = {
+            'js': 'javascript', 'ts': 'typescript', 'py': 'python',
+            'rb': 'ruby', 'sh': 'bash', 'shell': 'bash', 'zsh': 'bash',
+            'yml': 'yaml', 'md': 'markdown', 'cs': 'csharp',
+            'c++': 'cpp', 'h++': 'cpp', 'hpp': 'cpp',
+        }
+        
+        lang = aliases.get(info.lower().strip(), info.lower().strip())
+        
+        try:
+            return get_lexer_by_name(lang, stripall=True)
+        except ClassNotFound:
+            try:
+                return guess_lexer(code)
+            except ClassNotFound:
+                return TextLexer()
+    
+    def codespan(self, text):
+        """渲染行内代码"""
+        if MARKDOWN_LIBS_AVAILABLE:
+            escaped = mistune.escape(text)
+        else:
+            escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        return f'<code class="inline-code">{escaped}</code>'
+
+
+class MarkdownParser:
+    """
+    Markdown 解析器封装 - 单例模式
+    使用 mistune 解析 Markdown，生成结构化的 AST
+    """
+    
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._init_parser()
+        return cls._instance
+    
+    def _init_parser(self):
+        """初始化解析器"""
+        if not MARKDOWN_LIBS_AVAILABLE:
+            self.renderer = None
+            self.markdown = None
+            self.token_parser = None
+            return
+            
+        self.renderer = PygmentsRenderer(style='monokai')
+        self.markdown = mistune.create_markdown(
+            renderer=self.renderer,
+            plugins=['table', 'strikethrough', 'url']
+        )
+        # Token 解析器（用于分离内容片段）- mistune 3.x 使用 Markdown 类
+        self.token_parser = mistune.Markdown()
+    
+    def parse_to_html(self, text):
+        """将 Markdown 转换为 HTML"""
+        if MARKDOWN_LIBS_AVAILABLE and self.markdown:
+            return self.markdown(text)
+        else:
+            # 降级处理：简单的 HTML 转义
+            return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+    
+    def parse_to_tokens(self, text):
+        """将 Markdown 解析为 tokens（抽象语法树）
+        mistune 3.x: parse() 返回 (tokens, state) 元组
+        """
+        if MARKDOWN_LIBS_AVAILABLE and self.token_parser:
+            tokens, state = self.token_parser.parse(text)
+            return tokens
+        return []
+    
+    def split_content(self, text):
+        """
+        将内容分割为代码块和普通文本片段
+        返回: list[{'type': 'code'|'text', 'language': str, 'content': str}, ...]
+        """
+        if MARKDOWN_LIBS_AVAILABLE and self.token_parser:
+            return self._split_by_tokens(text)
+        else:
+            # 降级处理：使用正则表达式
+            return self._split_by_regex(text)
+    
+    def _split_by_tokens(self, text):
+        """使用 mistune 3.x tokens 解析分割内容"""
+        tokens, state = self.token_parser.parse(text)
+        result = []
+        
+        for token in tokens:
+            token_type = token.get('type', '')
+            
+            # 跳过空白行
+            if token_type == 'blank_line':
+                continue
+            
+            if token_type == 'block_code':
+                # 获取语言信息 - mistune 3.x 使用 attrs.info
+                attrs = token.get('attrs', {})
+                lang = attrs.get('info', '').strip() if attrs else ''
+                result.append({
+                    'type': 'code',
+                    'language': lang or 'code',
+                    'content': token.get('raw', '')
+                })
+            elif token_type == 'paragraph':
+                text_content = self._extract_text(token.get('children', []))
+                if text_content.strip():
+                    result.append({
+                        'type': 'text',
+                        'content': text_content
+                    })
+            elif token_type == 'heading':
+                text_content = self._extract_text(token.get('children', []))
+                attrs = token.get('attrs', {})
+                level = attrs.get('level', 1) if attrs else 1
+                if text_content.strip():
+                    result.append({
+                        'type': 'text',
+                        'content': f"{'#' * level} {text_content}"
+                    })
+            elif token_type == 'block_html':
+                raw = token.get('raw', '')
+                if raw.strip():
+                    result.append({
+                        'type': 'text',
+                        'content': raw
+                    })
+            elif token_type == 'list':
+                items = token.get('children', [])
+                list_text = ""
+                for item in items:
+                    item_text = self._extract_text(item.get('children', []))
+                    list_text += f"• {item_text}\n"
+                if list_text.strip():
+                    result.append({
+                        'type': 'text',
+                        'content': list_text.rstrip()
+                    })
+            elif token_type == 'table':
+                # 表格作为原始 Markdown 保留
+                table_text = self._render_table(token)
+                if table_text.strip():
+                    result.append({
+                        'type': 'text',
+                        'content': table_text
+                    })
+            elif token_type == 'thematic_break':
+                result.append({
+                    'type': 'text',
+                    'content': '---'
+                })
+        
+        return result
+    
+    def _extract_text(self, children):
+        """从 AST 节点中递归提取文本"""
+        if not children:
+            return ''
+        
+        text_parts = []
+        for child in children:
+            child_type = child.get('type', '')
+            
+            if child_type == 'text':
+                text_parts.append(child.get('raw', ''))
+            elif child_type == 'codespan':
+                text_parts.append(f"`{child.get('raw', '')}`")
+            elif child_type == 'strong':
+                inner = self._extract_text(child.get('children', []))
+                text_parts.append(f"**{inner}**")
+            elif child_type == 'emphasis':
+                inner = self._extract_text(child.get('children', []))
+                text_parts.append(f"*{inner}*")
+            elif child_type == 'link':
+                inner = self._extract_text(child.get('children', []))
+                url = child.get('url', '')
+                text_parts.append(f"[{inner}]({url})")
+            elif child_type == 'image':
+                alt = child.get('alt', '')
+                url = child.get('url', '')
+                text_parts.append(f"![{alt}]({url})")
+            elif 'children' in child:
+                text_parts.append(self._extract_text(child['children']))
+        
+        return ' '.join(text_parts)
+    
+    def _render_table(self, node):
+        """渲染表格为文本表示"""
+        children = node.get('children', [])
+        if not children:
+            return ''
+        
+        result = []
+        for child in children:
+            if child.get('type') == 'table_head':
+                cells = []
+                for cell in child.get('children', []):
+                    cell_text = self._extract_text(cell.get('children', []))
+                    cells.append(cell_text)
+                result.append('| ' + ' | '.join(cells) + ' |')
+                result.append('| ' + ' | '.join(['---'] * len(cells)) + ' |')
+            elif child.get('type') == 'table_body':
+                for row in child.get('children', []):
+                    cells = []
+                    for cell in row.get('children', []):
+                        cell_text = self._extract_text(cell.get('children', []))
+                        cells.append(cell_text)
+                    result.append('| ' + ' | '.join(cells) + ' |')
+        
+        return '\n'.join(result)
+    
+    def _split_by_regex(self, text):
+        """使用正则表达式分割内容（降级方案）"""
+        result = []
+        # 匹配代码块
+        code_pattern = r'```([^\n]*)\n([\s\S]*?)```'
+        last_end = 0
+        
+        for match in re.finditer(code_pattern, text):
+            # 添加代码块之前的文本
+            if match.start() > last_end:
+                plain_text = text[last_end:match.start()].strip()
+                if plain_text:
+                    result.append({
+                        'type': 'text',
+                        'content': plain_text
+                    })
+            
+            # 添加代码块
+            lang = match.group(1).strip() or 'code'
+            code = match.group(2)
+            if code.strip():
+                result.append({
+                    'type': 'code',
+                    'language': lang,
+                    'content': code
+                })
+            
+            last_end = match.end()
+        
+        # 添加最后的文本
+        if last_end < len(text):
+            remaining = text[last_end:].strip()
+            if remaining:
+                result.append({
+                    'type': 'text',
+                    'content': remaining
+                })
+        
+        return result if result else [{'type': 'text', 'content': text}]
+
+
+# 获取全局解析器实例
+def get_markdown_parser():
+    """获取 Markdown 解析器单例"""
+    return MarkdownParser()
+
 
 # ==================== 配置对话框 ====================
 class SettingsDialog(QDialog):
@@ -252,10 +565,94 @@ class AIRequestThread(QThread):
 
 # ==================== 消息组件（支持代码块复制，美化版，高度自适应，优化版）====================
 class CodeBlockWidget(QWidget):
+    """
+    代码块控件 - 支持语法高亮
+    使用 Pygments 进行代码高亮，使用 mistune 解析语言
+    """
+    
+    # Monokai 风格的 CSS 样式
+    HIGHLIGHT_CSS = """
+    <style>
+        body { background: transparent; margin: 0; padding: 0; }
+        pre { margin: 0; white-space: pre-wrap; word-wrap: break-word; }
+        .code-highlight { background: transparent; padding: 0; margin: 0; }
+        .code-highlight .hll { background-color: #49483e }
+        .code-highlight .c { color: #75715e; font-style: italic } /* Comment */
+        .code-highlight .err { color: #960050; background-color: #1e0010 } /* Error */
+        .code-highlight .k { color: #66d9ef; font-weight: bold } /* Keyword */
+        .code-highlight .l { color: #ae81ff } /* Literal */
+        .code-highlight .n { color: #f8f8f2 } /* Name */
+        .code-highlight .o { color: #f92672 } /* Operator */
+        .code-highlight .p { color: #f8f8f2 } /* Punctuation */
+        .code-highlight .ch { color: #75715e } /* Comment.Hashbang */
+        .code-highlight .cm { color: #75715e } /* Comment.Multiline */
+        .code-highlight .cp { color: #75715e } /* Comment.Preproc */
+        .code-highlight .cpf { color: #75715e } /* Comment.PreprocFile */
+        .code-highlight .c1 { color: #75715e } /* Comment.Single */
+        .code-highlight .cs { color: #75715e } /* Comment.Special */
+        .code-highlight .gd { color: #f92672 } /* Generic.Deleted */
+        .code-highlight .ge { font-style: italic } /* Generic.Emph */
+        .code-highlight .gi { color: #a6e22e } /* Generic.Inserted */
+        .code-highlight .gs { font-weight: bold } /* Generic.Strong */
+        .code-highlight .gu { color: #75715e } /* Generic.Subheading */
+        .code-highlight .kc { color: #66d9ef } /* Keyword.Constant */
+        .code-highlight .kd { color: #66d9ef } /* Keyword.Declaration */
+        .code-highlight .kn { color: #f92672 } /* Keyword.Namespace */
+        .code-highlight .kp { color: #66d9ef } /* Keyword.Pseudo */
+        .code-highlight .kr { color: #66d9ef } /* Keyword.Reserved */
+        .code-highlight .kt { color: #66d9ef } /* Keyword.Type */
+        .code-highlight .ld { color: #e6db74 } /* Literal.Date */
+        .code-highlight .m { color: #ae81ff } /* Literal.Number */
+        .code-highlight .s { color: #e6db74 } /* Literal.String */
+        .code-highlight .na { color: #a6e22e } /* Name.Attribute */
+        .code-highlight .nb { color: #f8f8f2 } /* Name.Builtin */
+        .code-highlight .nc { color: #a6e22e } /* Name.Class */
+        .code-highlight .no { color: #66d9ef } /* Name.Constant */
+        .code-highlight .nd { color: #a6e22e } /* Name.Decorator */
+        .code-highlight .ni { color: #f8f8f2 } /* Name.Entity */
+        .code-highlight .ne { color: #a6e22e } /* Name.Exception */
+        .code-highlight .nf { color: #a6e22e } /* Name.Function */
+        .code-highlight .nl { color: #f8f8f2 } /* Name.Label */
+        .code-highlight .nn { color: #f8f8f2 } /* Name.Namespace */
+        .code-highlight .nx { color: #a6e22e } /* Name.Other */
+        .code-highlight .py { color: #f8f8f2 } /* Name.Property */
+        .code-highlight .nt { color: #f92672 } /* Name.Tag */
+        .code-highlight .nv { color: #f8f8f2 } /* Name.Variable */
+        .code-highlight .ow { color: #f92672 } /* Operator.Word */
+        .code-highlight .w { color: #f8f8f2 } /* Text.Whitespace */
+        .code-highlight .mb { color: #ae81ff } /* Literal.Number.Bin */
+        .code-highlight .mf { color: #ae81ff } /* Literal.Number.Float */
+        .code-highlight .mh { color: #ae81ff } /* Literal.Number.Hex */
+        .code-highlight .mi { color: #ae81ff } /* Literal.Number.Integer */
+        .code-highlight .mo { color: #ae81ff } /* Literal.Number.Oct */
+        .code-highlight .sa { color: #e6db74 } /* Literal.String.Affix */
+        .code-highlight .sb { color: #e6db74 } /* Literal.String.Backtick */
+        .code-highlight .sc { color: #e6db74 } /* Literal.String.Char */
+        .code-highlight .dl { color: #e6db74 } /* Literal.String.Delimiter */
+        .code-highlight .sd { color: #e6db74 } /* Literal.String.Doc */
+        .code-highlight .s2 { color: #e6db74 } /* Literal.String.Double */
+        .code-highlight .se { color: #ae81ff } /* Literal.String.Escape */
+        .code-highlight .sh { color: #e6db74 } /* Literal.String.Heredoc */
+        .code-highlight .si { color: #e6db74 } /* Literal.String.Interpol */
+        .code-highlight .sx { color: #e6db74 } /* Literal.String.Other */
+        .code-highlight .sr { color: #e6db74 } /* Literal.String.Regex */
+        .code-highlight .s1 { color: #e6db74 } /* Literal.String.Single */
+        .code-highlight .ss { color: #e6db74 } /* Literal.String.Symbol */
+        .code-highlight .bp { color: #f8f8f2 } /* Name.Builtin.Pseudo */
+        .code-highlight .fm { color: #a6e22e } /* Name.Function.Magic */
+        .code-highlight .vc { color: #f8f8f2 } /* Name.Variable.Class */
+        .code-highlight .vg { color: #f8f8f2 } /* Name.Variable.Global */
+        .code-highlight .vi { color: #f8f8f2 } /* Name.Variable.Instance */
+        .code-highlight .vm { color: #f8f8f2 } /* Name.Variable.Magic */
+        .code-highlight .il { color: #ae81ff } /* Literal.Number.Integer.Long */
+    </style>
+    """
+    
     def __init__(self, code: str, language: str = ""):
         super().__init__()
         self.code = code
         self.language = language
+        self.parser = get_markdown_parser()
         self.setup_ui()
 
     def setup_ui(self):
@@ -305,15 +702,18 @@ class CodeBlockWidget(QWidget):
 
         layout.addWidget(header)
 
-        # 代码区域 - 高度自适应逻辑
-        self.code_text = QTextEdit()
-        self.code_text.setReadOnly(True)
-        self.code_text.setPlainText(self.code)
-        # 隐藏滚动条，高度自适应
-        self.code_text.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.code_text.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.code_text.setStyleSheet("""
-            QTextEdit {
+        # 代码区域 - 使用 QTextBrowser 显示高亮后的 HTML
+        self.code_display = QTextBrowser()
+        self.code_display.setReadOnly(True)
+        self.code_display.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+        )
+        self.code_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.code_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        # 设置样式
+        self.code_display.setStyleSheet("""
+            QTextBrowser {
                 background: #1e1e2e;
                 color: #e2e8f0;
                 font-family: 'SF Mono', 'Consolas', 'Courier New', monospace;
@@ -322,23 +722,68 @@ class CodeBlockWidget(QWidget):
                 border-bottom-left-radius: 12px;
                 border-bottom-right-radius: 12px;
                 padding: 16px;
-                selection-background-color: #4a5568;
             }
         """)
-        # 设置高度自适应
-        self.code_text.document().documentLayout().documentSizeChanged.connect(
+        
+        # 使用 Pygments 高亮代码
+        highlighted_html = self._highlight_code()
+        self.code_display.setHtml(highlighted_html)
+        
+        # 高度自适应
+        self.code_display.document().documentLayout().documentSizeChanged.connect(
             self._adjust_code_height
         )
         # 立即设置初始高度
         QTimer.singleShot(0, self._adjust_code_height)
-        layout.addWidget(self.code_text)
+        layout.addWidget(self.code_display)
+
+    def _highlight_code(self):
+        """使用 Pygments 生成高亮的 HTML"""
+        if not MARKDOWN_LIBS_AVAILABLE:
+            # 降级处理：纯文本显示
+            escaped_code = self.code.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            return f"<pre style='color: #e2e8f0; margin: 0;'>{escaped_code}</pre>"
+        
+        try:
+            lexer = self._get_lexer()
+            formatter = HtmlFormatter(style='monokai', cssclass='code-highlight', nowrap=False)
+            highlighted = highlight(self.code, lexer, formatter)
+            return f"{self.HIGHLIGHT_CSS}<body>{highlighted}</body>"
+        except Exception as e:
+            # 出错时降级为普通文本
+            escaped_code = self.code.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            return f"<pre style='color: #e2e8f0; margin: 0;'>{escaped_code}</pre>"
+    
+    def _get_lexer(self):
+        """获取适合的词法分析器"""
+        if not MARKDOWN_LIBS_AVAILABLE:
+            return None
+        
+        if self.language:
+            # 语言别名映射
+            aliases = {
+                'js': 'javascript', 'ts': 'typescript', 'py': 'python',
+                'sh': 'bash', 'shell': 'bash', 'yml': 'yaml',
+                'rb': 'ruby', 'cs': 'csharp', 'c++': 'cpp',
+            }
+            lang = aliases.get(self.language.lower(), self.language.lower())
+            try:
+                return get_lexer_by_name(lang, stripall=True)
+            except ClassNotFound:
+                pass
+        
+        # 尝试自动检测
+        try:
+            return guess_lexer(self.code)
+        except ClassNotFound:
+            return TextLexer()
 
     def _adjust_code_height(self):
         """调整代码块高度以适应内容"""
         try:
-            doc = self.code_text.document()
+            doc = self.code_display.document()
             height = int(doc.size().height()) + 40  # 额外空间避免截断
-            self.code_text.setFixedHeight(max(height, 60))  # 最小高度60px
+            self.code_display.setFixedHeight(max(height, 60))  # 最小高度60px
         except RuntimeError:
             pass
 
@@ -351,7 +796,7 @@ class CodeBlockWidget(QWidget):
 
 
 class MessageWidget(QFrame):
-    """消息控件 - 优化版，支持流式输出时复用文本浏览器"""
+    """消息控件 - 使用 mistune 解析 Markdown，支持代码块语法高亮"""
     
     def __init__(self, role: str, content: str, image_data_list: List[str] = None, parent=None):
         super().__init__(parent)
@@ -364,19 +809,12 @@ class MessageWidget(QFrame):
         self.text_layout = None
         self.outer_layout = None
         
-        # 优化：缓存文本浏览器引用，避免重复创建
+        # 缓存文本浏览器引用（用于流式输出）
         self._cached_text_browser: Optional[QTextBrowser] = None
         self._cached_code_blocks: List[CodeBlockWidget] = []
         
-        # 防抖定时器 - 只连接一次信号，通过更新参数避免 disconnect
-        self._height_adjust_timer = QTimer()
-        self._height_adjust_timer.setSingleShot(True)
-        self._height_adjust_timer.setInterval(16)  # ~60fps
-        self._height_adjust_timer.timeout.connect(self._do_height_adjustment)
-        
-        # 高度调整参数缓存
-        self._pending_text_browser: Optional[QTextBrowser] = None
-        self._pending_size = None
+        # Markdown 解析器
+        self.parser = get_markdown_parser()
         
         self.setup_ui()
 
@@ -416,15 +854,44 @@ class MessageWidget(QFrame):
         self._update_text_only(new_content)
 
     def _update_text_only(self, content: str):
-        """快速更新纯文本内容 - 复用现有文本浏览器"""
+        """快速更新纯文本内容 - 流式输出期间使用"""
         if self._cached_text_browser is None:
-            # 首次创建
+            # 首次创建 - 创建一个简单的文本浏览器用于流式输出
             self._clear_layout(self.text_layout)
-            self._create_text_browser(content)
-        else:
-            # 复用现有控件
-            html_text = self.process_inline_code(content.strip(), user=False)
-            self._cached_text_browser.setHtml(html_text)
+            text_browser = QTextBrowser()
+            text_browser.setReadOnly(True)
+            text_browser.setTextInteractionFlags(
+                Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+            )
+            text_browser.setOpenExternalLinks(False)
+            text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            text_browser.setStyleSheet("""
+                QTextBrowser {
+                    background: transparent;
+                    border: none;
+                    font-size: 15px;
+                    padding: 4px 0;
+                }
+            """)
+            
+            # 设置初始高度
+            text_browser.setMinimumHeight(100)
+            
+            self.text_layout.addWidget(text_browser)
+            self._cached_text_browser = text_browser
+        
+        # 更新内容
+        html_text = self.process_inline_code(content.strip(), user=False)
+        self._cached_text_browser.setHtml(html_text)
+        
+        # 更新高度
+        try:
+            doc = self._cached_text_browser.document()
+            height = int(doc.size().height()) + 20
+            self._cached_text_browser.setFixedHeight(max(height, 50))
+        except RuntimeError:
+            pass
 
     def _has_unclosed_code_block(self, content: str) -> bool:
         """检查是否存在未闭合的代码块"""
@@ -451,77 +918,6 @@ class MessageWidget(QFrame):
         self._cached_code_blocks.clear()
         self._cached_text_browser = None
         self.parse_content(self.text_layout, self.content, user=False)
-
-    def _create_text_browser(self, content: str) -> QTextBrowser:
-        """创建新的文本浏览器"""
-        text_browser = QTextBrowser()
-        text_browser.setReadOnly(True)
-        text_browser.setTextInteractionFlags(
-            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
-        )
-        text_browser.setOpenExternalLinks(False)
-        text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        text_browser.setStyleSheet("""
-            QTextBrowser {
-                background: transparent;
-                border: none;
-                font-size: 15px;
-                padding: 4px 0;
-            }
-            QTextBrowser::selection {
-                background: #667eea;
-                color: white;
-            }
-        """)
-        
-        # 设置内容
-        html_text = self.process_inline_code(content.strip(), user=False)
-        text_browser.setHtml(html_text)
-        
-        # 高度自适应 - 使用防抖
-        text_browser.document().documentLayout().documentSizeChanged.connect(
-            lambda size, tb=text_browser: self._schedule_height_adjustment(tb, size)
-        )
-        # 立即设置初始高度，避免需要滚动查看
-        QTimer.singleShot(0, lambda tb=text_browser: tb.setFixedHeight(
-            int(tb.document().size().height()) + 10
-        ))
-        
-        self.text_layout.addWidget(text_browser)
-        self._cached_text_browser = text_browser
-        return text_browser
-
-    def _schedule_height_adjustment(self, text_browser: QTextBrowser, size):
-        """防抖的高度调整调度器 - 更新参数并启动定时器"""
-        # 更新待处理的参数（替代断开/重新连接）
-        self._pending_text_browser = text_browser
-        self._pending_size = size
-        
-        # 重新启动定时器（取消之前的等待）
-        self._height_adjust_timer.start()
-
-    def _do_height_adjustment(self):
-        """实际执行高度调整（由定时器触发）"""
-        if self._pending_text_browser is None or self._pending_size is None:
-            return
-        
-        try:
-            text_browser = self._pending_text_browser
-            size = self._pending_size
-            
-            if text_browser and not text_browser.isVisible():
-                return
-            
-            height = int(size.height()) + 10
-            text_browser.setFixedHeight(height)
-        except RuntimeError:
-            # 控件可能已被删除
-            pass
-        finally:
-            # 清理参数
-            self._pending_text_browser = None
-            self._pending_size = None
 
     def _clear_layout(self, layout: QVBoxLayout):
         """清理布局中的所有子控件"""
@@ -598,72 +994,81 @@ class MessageWidget(QFrame):
         return None
 
     def parse_content(self, layout: QVBoxLayout, content: str, user: bool):
-        """解析内容，支持代码块和普通文本"""
+        """
+        解析内容，支持代码块和普通文本
+        使用 mistune AST 解析替代正则表达式
+        """
         if not content:
             return
-            
-        # 修复问题1：改进代码块正则表达式，更准确地匹配
-        # 匹配格式：```language\ncode```
-        code_pattern = r'```([^\n]*)\n([\s\S]*?)```'
-        parts = re.split(code_pattern, content)
-
-        # parts结构: [普通文本, 语言, 代码, 普通文本, 语言, 代码, ...]
-        i = 0
-        while i < len(parts):
-            if i % 3 == 0:  # 普通文本
-                text = parts[i].strip()
-                if text:
-                    html_text = self.process_inline_code(text, user)
-                    
-                    # 复用或创建文本浏览器
-                    if self._cached_text_browser is None and not user:
-                        self._create_text_browser(text)
-                    else:
-                        # 使用 QTextBrowser 支持文本选择和复制
-                        text_browser = QTextBrowser()
-                        text_browser.setHtml(html_text)
-                        text_browser.setReadOnly(True)
-                        text_browser.setTextInteractionFlags(
-                            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
-                        )
-                        text_browser.setOpenExternalLinks(False)
-                        text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                        text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                        text_browser.setStyleSheet("""
-                            QTextBrowser {
-                                background: transparent;
-                                border: none;
-                                font-size: 15px;
-                                padding: 4px 0;
-                            }
-                            QTextBrowser::selection {
-                                background: #667eea;
-                                color: white;
-                            }
-                        """)
-                        # 自适应高度 - 使用防抖
-                        text_browser.document().documentLayout().documentSizeChanged.connect(
-                            lambda size, tb=text_browser: self._schedule_height_adjustment(tb, size)
-                        )
-                        # 立即设置初始高度，避免需要滚动查看
-                        QTimer.singleShot(0, lambda tb=text_browser: tb.setFixedHeight(
-                            int(tb.document().size().height()) + 10
-                        ))
-                        layout.addWidget(text_browser)
-                i += 1
-            elif i % 3 == 1:  # 语言名称
-                lang = parts[i] if parts[i] else "code"
-                # 确保 i+1 在范围内，且代码内容不为空时才创建代码块
-                if i + 1 < len(parts):
-                    code = parts[i + 1]
-                    # 只有当代码内容不为空时才创建代码块控件
-                    if code.strip():
-                        code_block = CodeBlockWidget(code, lang)
-                        layout.addWidget(code_block)
-                        # 缓存代码块引用
-                        if not user:
-                            self._cached_code_blocks.append(code_block)
-                i += 2  # 跳过语言名称和代码内容，下一个是普通文本
+        
+        # 使用 MarkdownParser 分割内容
+        segments = self.parser.split_content(content)
+        
+        for segment in segments:
+            if segment['type'] == 'code':
+                # 创建代码块控件（支持语法高亮）
+                code = segment['content']
+                lang = segment.get('language', 'code')
+                
+                if code.strip():
+                    code_block = CodeBlockWidget(code, lang)
+                    layout.addWidget(code_block)
+                    # 缓存代码块引用
+                    if not user:
+                        self._cached_code_blocks.append(code_block)
+            else:
+                # 普通文本
+                text = segment['content']
+                if text.strip():
+                    self._add_text_segment(layout, text, user)
+    
+    def _add_text_segment(self, layout: QVBoxLayout, text: str, user: bool):
+        """添加一个文本片段到布局中"""
+        html_text = self.process_inline_code(text, user)
+        
+        # 创建 QTextBrowser
+        text_browser = QTextBrowser()
+        text_browser.setHtml(html_text)
+        text_browser.setReadOnly(True)
+        text_browser.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+        )
+        text_browser.setOpenExternalLinks(False)
+        text_browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        text_browser.setStyleSheet("""
+            QTextBrowser {
+                background: transparent;
+                border: none;
+                font-size: 15px;
+                padding: 4px 0;
+            }
+            QTextBrowser::selection {
+                background: #667eea;
+                color: white;
+            }
+        """)
+        
+        # 添加到布局
+        layout.addWidget(text_browser)
+        
+        # 高度自适应 - 使用信号连接确保文档渲染完成后更新高度
+        def update_height(tb):
+            try:
+                doc = tb.document()
+                if doc:
+                    height = int(doc.size().height()) + 20
+                    tb.setFixedHeight(max(height, 20))
+            except RuntimeError:
+                pass
+        
+        # 连接文档大小变化信号
+        text_browser.document().documentLayout().documentSizeChanged.connect(
+            lambda size, tb=text_browser: update_height(tb)
+        )
+        
+        # 使用更长的延迟确保文档已渲染
+        QTimer.singleShot(50, lambda tb=text_browser: update_height(tb))
 
     def process_inline_code(self, text: str, user: bool) -> str:
         """处理行内代码和格式"""
@@ -693,7 +1098,7 @@ class ChatWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI 聊天机器人 V0.3")
+        self.setWindowTitle("AI 聊天机器人 V0.4.0")
         self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
 
@@ -1068,7 +1473,9 @@ class ChatWindow(QMainWindow):
                     }
                     lang = lang_map.get(ext, '')
                     
-                    safe_content = content.replace('```', '｀｀｀')
+                    # 使用零宽空格转义，防止文件内容中的 ``` 干扰消息格式
+                    # 显示时会恢复正常的外观
+                    safe_content = content.replace('```', '`\u200B`\u200B`')
                     
                     current_text = self.input_edit.toPlainText()
                     wrapped_content = f"\n[文件: {os.path.basename(file_path)}]\n```{lang}\n{safe_content}\n```\n"
@@ -1234,7 +1641,7 @@ class ChatWindow(QMainWindow):
                 self.api_worker.stream_chunk.disconnect()
                 self.api_worker.finished_stream.disconnect()
                 self.api_worker.error_occurred.disconnect()
-            except RuntimeError:
+            except (RuntimeError, TypeError):
                 pass  # 信号可能已断开
             self.api_worker = None
         
@@ -1647,6 +2054,7 @@ class ChatWindow(QMainWindow):
             return False
 
     def clear_all_history(self):
+        self._cancel_current_request()
         reply = QMessageBox.question(
             self, "确认清除", 
             "确定要清除所有对话历史吗？此操作不可恢复！",
@@ -1683,6 +2091,7 @@ class ChatWindow(QMainWindow):
             self.conversation_list.takeItem(self.conversation_list.row(item))
             self.save_conversations()
             if conv_id == self.current_conversation_id:
+                self._cancel_current_request()
                 if self.conversation_list.count() > 0:
                     self.conversation_list.setCurrentRow(0)
                 else:
