@@ -1485,8 +1485,8 @@ class ChatWindow(QMainWindow):
                     QMessageBox.critical(self, "错误", f"读取文件失败: {e}")
 
     def _read_file_with_encoding(self, file_path: str) -> str:
-        """修复问题6：使用多种编码尝试读取文件"""
-        encodings = ['utf-8', 'gbk', 'gb2312', 'big5', 'shift_jis', 'latin-1']
+        """使用多种编码尝试读取文件"""
+        encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'big5', 'shift_jis', 'latin-1']
         
         for encoding in encodings:
             try:
