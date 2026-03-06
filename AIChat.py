@@ -17,30 +17,24 @@ from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QImage
 import openai
 import uuid
 from datetime import datetime
+import mistune
+from pygments import highlight
+from pygments.lexers import get_lexer_by_name, guess_lexer, TextLexer
+from pygments.formatters import HtmlFormatter
+from pygments.util import ClassNotFound
 import os
 
 # ==================== Markdown 解析器（使用 mistune + Pygments）====================
-# 尝试导入 mistune 和 pygments，如果不可用则使用正则表达式降级处理
-try:
-    import mistune
-    from pygments import highlight
-    from pygments.lexers import get_lexer_by_name, guess_lexer, TextLexer
-    from pygments.formatters import HtmlFormatter
-    from pygments.util import ClassNotFound
-    MARKDOWN_LIBS_AVAILABLE = True
-except ImportError:
-    MARKDOWN_LIBS_AVAILABLE = False
-    print("警告: mistune 或 pygments 未安装，将使用正则表达式解析。建议运行: pip install mistune pygments")
 
 
-class PygmentsRenderer(mistune.HTMLRenderer if MARKDOWN_LIBS_AVAILABLE else object):
+
+class PygmentsRenderer(mistune.HTMLRenderer):
     """
     使用 Pygments 进行代码高亮的 mistune 渲染器
     """
     
     def __init__(self, style='monokai', css_class='code-highlight', *args, **kwargs):
-        if MARKDOWN_LIBS_AVAILABLE:
-            super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.style = style
         self.css_class = css_class
     
@@ -48,9 +42,6 @@ class PygmentsRenderer(mistune.HTMLRenderer if MARKDOWN_LIBS_AVAILABLE else obje
         """渲染代码块"""
         if not code or not code.strip():
             return ''
-        
-        if not MARKDOWN_LIBS_AVAILABLE:
-            return f'<pre><code>{code}</code></pre>'
         
         lexer = self._get_lexer(code, info)
         formatter = HtmlFormatter(
@@ -64,9 +55,6 @@ class PygmentsRenderer(mistune.HTMLRenderer if MARKDOWN_LIBS_AVAILABLE else obje
     
     def _get_lexer(self, code, info):
         """获取合适的词法分析器"""
-        if not MARKDOWN_LIBS_AVAILABLE:
-            return None
-            
         if not info:
             try:
                 return guess_lexer(code)
@@ -93,10 +81,7 @@ class PygmentsRenderer(mistune.HTMLRenderer if MARKDOWN_LIBS_AVAILABLE else obje
     
     def codespan(self, text):
         """渲染行内代码"""
-        if MARKDOWN_LIBS_AVAILABLE:
-            escaped = mistune.escape(text)
-        else:
-            escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        escaped = mistune.escape(text)
         return f'<code class="inline-code">{escaped}</code>'
 
 
@@ -116,12 +101,6 @@ class MarkdownParser:
     
     def _init_parser(self):
         """初始化解析器"""
-        if not MARKDOWN_LIBS_AVAILABLE:
-            self.renderer = None
-            self.markdown = None
-            self.token_parser = None
-            return
-            
         self.renderer = PygmentsRenderer(style='monokai')
         self.markdown = mistune.create_markdown(
             renderer=self.renderer,
@@ -132,31 +111,21 @@ class MarkdownParser:
     
     def parse_to_html(self, text):
         """将 Markdown 转换为 HTML"""
-        if MARKDOWN_LIBS_AVAILABLE and self.markdown:
-            return self.markdown(text)
-        else:
-            # 降级处理：简单的 HTML 转义
-            return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+        return self.markdown(text)
     
     def parse_to_tokens(self, text):
         """将 Markdown 解析为 tokens（抽象语法树）
         mistune 3.x: parse() 返回 (tokens, state) 元组
         """
-        if MARKDOWN_LIBS_AVAILABLE and self.token_parser:
-            tokens, state = self.token_parser.parse(text)
-            return tokens
-        return []
+        tokens, state = self.token_parser.parse(text)
+        return tokens
     
     def split_content(self, text):
         """
         将内容分割为代码块和普通文本片段
         返回: list[{'type': 'code'|'text', 'language': str, 'content': str}, ...]
         """
-        if MARKDOWN_LIBS_AVAILABLE and self.token_parser:
-            return self._split_by_tokens(text)
-        else:
-            # 降级处理：使用正则表达式
-            return self._split_by_regex(text)
+        return self._split_by_tokens(text)
     
     def _split_by_tokens(self, text):
         """使用 mistune 3.x tokens 解析分割内容"""
@@ -285,46 +254,6 @@ class MarkdownParser:
                     result.append('| ' + ' | '.join(cells) + ' |')
         
         return '\n'.join(result)
-    
-    def _split_by_regex(self, text):
-        """使用正则表达式分割内容（降级方案）"""
-        result = []
-        # 匹配代码块
-        code_pattern = r'```([^\n]*)\n([\s\S]*?)```'
-        last_end = 0
-        
-        for match in re.finditer(code_pattern, text):
-            # 添加代码块之前的文本
-            if match.start() > last_end:
-                plain_text = text[last_end:match.start()].strip()
-                if plain_text:
-                    result.append({
-                        'type': 'text',
-                        'content': plain_text
-                    })
-            
-            # 添加代码块
-            lang = match.group(1).strip() or 'code'
-            code = match.group(2)
-            if code.strip():
-                result.append({
-                    'type': 'code',
-                    'language': lang,
-                    'content': code
-                })
-            
-            last_end = match.end()
-        
-        # 添加最后的文本
-        if last_end < len(text):
-            remaining = text[last_end:].strip()
-            if remaining:
-                result.append({
-                    'type': 'text',
-                    'content': remaining
-                })
-        
-        return result if result else [{'type': 'text', 'content': text}]
 
 
 # 获取全局解析器实例
@@ -776,26 +705,18 @@ class CodeBlockWidget(QWidget):
 
     def _highlight_code(self):
         """使用 Pygments 生成高亮的 HTML"""
-        if not MARKDOWN_LIBS_AVAILABLE:
-            # 降级处理：纯文本显示
-            escaped_code = self.code.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            return f"<pre style='color: #e2e8f0; margin: 0;'>{escaped_code}</pre>"
-        
         try:
             lexer = self._get_lexer()
             formatter = HtmlFormatter(style='monokai', cssclass='code-highlight', nowrap=False)
             highlighted = highlight(self.code, lexer, formatter)
             return f"{self.HIGHLIGHT_CSS}<body>{highlighted}</body>"
-        except Exception as e:
+        except Exception:
             # 出错时降级为普通文本
             escaped_code = self.code.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             return f"<pre style='color: #e2e8f0; margin: 0;'>{escaped_code}</pre>"
     
     def _get_lexer(self):
         """获取适合的词法分析器"""
-        if not MARKDOWN_LIBS_AVAILABLE:
-            return None
-        
         if self.language:
             # 语言别名映射
             aliases = {
@@ -849,35 +770,92 @@ class MessageWidget(QFrame):
         # 缓存文本浏览器引用（用于流式输出）
         self._cached_text_browser: Optional[QTextBrowser] = None
         self._cached_code_blocks: List[CodeBlockWidget] = []
+        # 缓存所有文本浏览器引用（用于全选）
+        self._all_text_browsers: List[QTextBrowser] = []
         
         # Markdown 解析器
         self.parser = get_markdown_parser()
         
+        # 启用焦点策略以支持键盘事件
+        self.setFocusPolicy(Qt.StrongFocus)
+        
         self.setup_ui()
 
     def setup_ui(self):
-        self.outer_layout = QHBoxLayout(self)
-        self.outer_layout.setContentsMargins(24, 8, 24, 8)
-        self.outer_layout.setSpacing(0)
-
+        # 使用垂直布局作为主布局（包含标题栏和内容）
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(24, 8, 24, 8)
+        main_layout.setSpacing(4)
+        
+        # 标题栏（包含角色标识和复制按钮）
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
+        
+        if self.role == "user":
+            # 用户消息：标题栏靠右
+            header_layout.addStretch()
+            role_label = QLabel("👤 我")
+            role_label.setStyleSheet("color: #667eea; font-size: 12px; font-weight: 600; background: transparent;")
+            header_layout.addWidget(role_label)
+        else:
+            # AI消息：标题栏靠左
+            role_label = QLabel("🤖 AI")
+            role_label.setStyleSheet("color: #48bb78; font-size: 12px; font-weight: 600; background: transparent;")
+            header_layout.addWidget(role_label)
+            header_layout.addStretch()
+        
+        # 复制全部按钮
+        self.copy_all_btn = QPushButton("📋 复制全部")
+        self.copy_all_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_all_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #718096;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                padding: 2px 10px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background: #edf2f7;
+                color: #4a5568;
+                border-color: #cbd5e0;
+            }
+        """)
+        self.copy_all_btn.clicked.connect(self.copy_all_content)
+        header_layout.addWidget(self.copy_all_btn)
+        
+        main_layout.addLayout(header_layout)
+        
+        # 内容区域
         self.text_container = QWidget()
         self.text_layout = QVBoxLayout(self.text_container)
         self.text_layout.setContentsMargins(0, 0, 0, 0)
         self.text_layout.setSpacing(10)
         self.text_container.setStyleSheet("")
         
+        # 水平布局用于对齐
+        content_h_layout = QHBoxLayout()
+        content_h_layout.setContentsMargins(0, 0, 0, 0)
+        content_h_layout.setSpacing(0)
+        
         if self.role == "user":
-            self.outer_layout.addStretch()
+            content_h_layout.addStretch()
             # 先添加所有图片（如果有）
             if self.image_data_list:
                 self.add_multiple_image_widgets(self.text_layout)
             self.parse_content(self.text_layout, self.content, user=True)
-            self.outer_layout.addWidget(self.text_container)  # 右对齐
+            content_h_layout.addWidget(self.text_container)  # 右对齐
         else:
             # AI 消息
             self.parse_content(self.text_layout, self.content, user=False)
-            self.outer_layout.addWidget(self.text_container)  # 左对齐
-            self.outer_layout.addStretch()
+            content_h_layout.addWidget(self.text_container)  # 左对齐
+            content_h_layout.addStretch()
+        
+        main_layout.addLayout(content_h_layout)
+        
+        # 保存外部布局引用（兼容旧代码）
+        self.outer_layout = QHBoxLayout()
 
     def update_content(self, new_content: str):
         """
@@ -969,6 +947,7 @@ class MessageWidget(QFrame):
         # 清空缓存引用
         self._cached_text_browser = None
         self._cached_code_blocks.clear()
+        self._all_text_browsers.clear()
 
     def add_multiple_image_widgets(self, layout: QVBoxLayout):
         """添加多张图片显示组件"""
@@ -1089,6 +1068,9 @@ class MessageWidget(QFrame):
         # 添加到布局
         layout.addWidget(text_browser)
         
+        # 缓存文本浏览器引用（用于全选）
+        self._all_text_browsers.append(text_browser)
+        
         # 高度自适应 - 使用信号连接确保文档渲染完成后更新高度
         def update_height(tb):
             try:
@@ -1125,6 +1107,54 @@ class MessageWidget(QFrame):
         text = text.replace('\n', '<br>')
         color = "#1e40af" if user else "#1a202c"
         return f'<div style="line-height: 1.7; color: {color};">{text}</div>'
+    
+    def get_all_text(self) -> str:
+        """获取消息的所有文本内容（纯文本格式）"""
+        # 直接返回原始内容，因为 self.content 保存了原始 markdown 文本
+        return self.content
+    
+    def copy_all_content(self):
+        """复制消息的全部内容到剪贴板"""
+        clipboard = QApplication.clipboard()
+        all_text = self.get_all_text()
+        clipboard.setText(all_text)
+        
+        # 更新按钮状态显示
+        self.copy_all_btn.setText("✅ 已复制")
+        QTimer.singleShot(1500, lambda: self.copy_all_btn.setText("📋 复制全部"))
+    
+    def select_all_text(self):
+        """选中消息内的所有文本（用于 CTRL+A）"""
+        # 选中所有文本浏览器中的内容
+        for text_browser in self._all_text_browsers:
+            try:
+                text_browser.selectAll()
+            except RuntimeError:
+                pass
+        
+        # 选中所有代码块中的内容
+        for code_block in self._cached_code_blocks:
+            try:
+                code_browser = code_block.code_display
+                code_browser.selectAll()
+            except (RuntimeError, AttributeError):
+                pass
+        
+        # 如果有缓存的文本浏览器（流式输出时），也选中
+        if self._cached_text_browser:
+            try:
+                self._cached_text_browser.selectAll()
+            except RuntimeError:
+                pass
+    
+    def keyPressEvent(self, event):
+        """处理键盘事件，实现 CTRL+A 全选"""
+        if event.key() == Qt.Key_A and event.modifiers() == Qt.ControlModifier:
+            # CTRL+A: 全选当前消息的所有内容
+            self.select_all_text()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
 
 # ==================== 主窗口 ====================
@@ -1135,7 +1165,7 @@ class ChatWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI 聊天机器人 V0.4.1")
+        self.setWindowTitle("AI 聊天机器人 V0.4.2")
         self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
 
