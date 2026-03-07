@@ -26,8 +26,6 @@ import os
 
 # ==================== Markdown 解析器（使用 mistune + Pygments）====================
 
-
-
 class PygmentsRenderer(mistune.HTMLRenderer):
     """
     使用 Pygments 进行代码高亮的 mistune 渲染器
@@ -107,7 +105,11 @@ class MarkdownParser:
             plugins=['table', 'strikethrough', 'url']
         )
         # Token 解析器（用于分离内容片段）- mistune 3.x 使用 Markdown 类
+        # 必须手动添加表格插件，否则表格会被解析为普通段落
         self.token_parser = mistune.Markdown()
+        # 添加表格插件支持
+        from mistune.plugins.table import table as table_plugin
+        table_plugin(self.token_parser)
     
     def parse_to_html(self, text):
         """将 Markdown 转换为 HTML"""
@@ -1090,7 +1092,30 @@ class MessageWidget(QFrame):
         QTimer.singleShot(50, lambda tb=text_browser: update_height(tb))
 
     def process_inline_code(self, text: str, user: bool) -> str:
-        """处理行内代码和格式"""
+        """处理行内代码和格式，支持表格渲染"""
+        color = "#1e40af" if user else "#1a202c"
+        
+        # 检测是否包含表格格式（至少两行且包含 | 分隔符）
+        # 表格格式：| col1 | col2 | 后跟 |---|---| 分隔行
+        table_pattern = r'^\|.+\|\s*\n\|[-\s|:]+\|\s*\n(\|.+\|\s*\n?)+'
+        if re.search(table_pattern, text, re.MULTILINE):
+            # 包含表格，使用完整的 Markdown 解析器
+            html = self.parser.parse_to_html(text)
+            # 为表格添加样式
+            styled_html = self._add_table_styles(html, color)
+            return f'<div style="line-height: 1.7; color: {color};">{styled_html}</div>'
+        
+        # 检测简化的表格格式（仅包含多行 | 分隔的内容）
+        lines = text.strip().split('\n')
+        table_lines = [line for line in lines if '|' in line and line.strip().startswith('|')]
+        if len(table_lines) >= 2:
+            # 可能是表格，尝试用 Markdown 解析
+            html = self.parser.parse_to_html(text)
+            if '<table' in html:
+                styled_html = self._add_table_styles(html, color)
+                return f'<div style="line-height: 1.7; color: {color};">{styled_html}</div>'
+        
+        # 普通文本处理
         # 先转义 HTML 特殊字符
         text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         
@@ -1105,8 +1130,55 @@ class MessageWidget(QFrame):
         text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
         text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
         text = text.replace('\n', '<br>')
-        color = "#1e40af" if user else "#1a202c"
         return f'<div style="line-height: 1.7; color: {color};">{text}</div>'
+    
+    def _add_table_styles(self, html: str, text_color: str) -> str:
+        """为表格 HTML 添加样式"""
+        # 表格样式
+        table_style = (
+            'border-collapse: collapse; '
+            'width: 100%; '
+            'margin: 10px 0; '
+            'font-size: 14px; '
+            'background: #fafafa; '
+            'border-radius: 8px; '
+            'overflow: hidden; '
+            'box-shadow: 0 1px 3px rgba(0,0,0,0.1);'
+        )
+        
+        # 表头样式
+        th_style = (
+            'background: #667eea; '
+            'color: white; '
+            'padding: 12px 16px; '
+            'text-align: left; '
+            'font-weight: 600; '
+            'border-bottom: 2px solid #5a67d8;'
+        )
+        
+        # 单元格样式
+        td_style = (
+            f'color: {text_color}; '
+            'padding: 10px 16px; '
+            'border-bottom: 1px solid #e2e8f0;'
+        )
+        
+        # 行样式
+        tr_style = 'background: #ffffff;'
+        
+        # 替换 <table>
+        html = re.sub(r'<table>', f'<table style="{table_style}">', html)
+        
+        # 替换 <th> - 在标签名后插入 style
+        html = re.sub(r'<th>', f'<th style="{th_style}">', html)
+        
+        # 替换 <td> - 在标签名后插入 style
+        html = re.sub(r'<td>', f'<td style="{td_style}">', html)
+        
+        # 替换 <tr>
+        html = re.sub(r'<tr>', f'<tr style="{tr_style}">', html)
+        
+        return html
     
     def get_all_text(self) -> str:
         """获取消息的所有文本内容（纯文本格式）"""
@@ -1165,7 +1237,7 @@ class ChatWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI 聊天机器人 V0.4.2")
+        self.setWindowTitle("AI 聊天机器人 V0.4.3")
         self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
 
