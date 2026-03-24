@@ -761,6 +761,7 @@ class ProcessMonitor(QThread):
         self._baseline_procs = set()       # 启动时已存在的非浏览器进程
         self._baseline_browser_pids = set()  # 启动时已存在的浏览器进程PID
         self._prev_new_browser_windows = False
+        self._prev_office_wps_running = False  # 跟踪 WPS/Office 是否有新增进程运行
 
         # ctypes 用于 Windows API
         self._ctypes = None
@@ -815,8 +816,13 @@ class ProcessMonitor(QThread):
         target_procs = current_procs & (self.OFFICE_PROCS | self.WPS_PROCS)
         new_procs = target_procs - self._baseline_procs
 
-        if new_procs:
+        has_new = bool(new_procs)
+        if has_new and not self._prev_office_wps_running:
             self.running.emit()
+        elif not has_new and self._prev_office_wps_running:
+            self.sleeping.emit()
+
+        self._prev_office_wps_running = has_new
 
     def _check_browser_windows(self):
         """检查浏览器窗口是否存在（通过窗口标题监测新标签页）"""
