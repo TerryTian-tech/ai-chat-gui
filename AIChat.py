@@ -2,10 +2,11 @@ import sys
 import re
 import json
 import base64
+import threading
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QByteArray, QBuffer
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QByteArray, QBuffer, Property, QEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QListWidget, QListWidgetItem, QPushButton, QTextEdit,
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QTextBrowser, QToolButton, QMenu, QInputDialog, QFileDialog,
     QCheckBox
 )
-from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QImage
+from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QImage, QPainterPath
 import openai
 import uuid
 from datetime import datetime
@@ -436,6 +437,448 @@ class SettingsDialog(QDialog):
             "model": self.model_edit.text(),
             "supports_vision": self.vision_checkbox.isChecked(),
         }
+
+
+class TigerWidget(QWidget):
+    """
+    桌面小老虎组件
+    点击关闭按钮时显示在桌面右下角，带奔跑动画
+    支持根据进程监控状态切换奔跑/睡眠模式
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._frame = 0
+        self._frames = []
+        self._is_running = True  # True=奔跑, False=睡眠
+        self._frame_sleeping = None  # 睡眠帧
+
+        # 窗口标志：置顶、无边框、不显示在任务栏
+        self.setWindowFlags(
+            Qt.Tool |
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(120, 80)
+
+        # 生成奔跑老虎的帧
+        self._generate_tiger_frames()
+        # 生成睡眠老虎的帧
+        self._generate_sleep_frame()
+
+        # 动画计时器
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._next_frame)
+        self._timer.start(80)  # 每80ms切换一帧，约12fps
+
+    def set_running_mode(self, is_running: bool):
+        """切换奔跑/睡眠模式"""
+        if self._is_running == is_running:
+            return
+        self._is_running = is_running
+        if is_running:
+            self._timer.start()
+        else:
+            self._timer.stop()
+        self.update()
+
+    def _generate_tiger_frames(self):
+        """生成奔跑老虎的简化动画帧"""
+        self._frames = []
+        # 简化的老虎轮廓帧 - 使用多个帧模拟奔跑动作
+        for i in range(4):
+            self._frames.append(self._draw_tiger_frame(i))
+
+    def _generate_sleep_frame(self):
+        """生成睡眠老虎的静态帧"""
+        self._frame_sleeping = self._draw_sleep_tiger()
+
+    def _draw_tiger_frame(self, frame_idx):
+        """绘制单帧老虎图像"""
+        from PySide6.QtGui import QPainter, QColor, QFont, QPen
+
+        # 创建120x80的图像
+        image = QImage(120, 80, QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 老虎颜色
+        orange = QColor(245, 140, 50)
+        black = QColor(30, 30, 30)
+        white = QColor(255, 255, 255)
+
+        # 简单的站立/奔跑姿态变换
+        # 身体矩形位置随帧变化
+        body_shifts = [(-3, 0), (0, 0), (3, 0), (0, 0)]
+        leg_offsets = [(-5, 0), (0, 5), (5, 0), (0, -5)]
+
+        shift_x, shift_y = body_shifts[frame_idx]
+        leg_off = leg_offsets[frame_idx]
+
+        # 身体
+        painter.setBrush(orange)
+        painter.setPen(Qt.NoPen)
+        body_x, body_y = 45 + shift_x, 25 + shift_y
+        body_w, body_h = 45, 30
+        painter.drawRoundedRect(body_x, body_y, body_w, body_h, 12, 12)
+
+        # 头部
+        head_x, head_y = 25 + shift_x, 15 + shift_y
+        painter.drawEllipse(head_x, head_y, 28, 25)
+
+        # 耳朵
+        painter.drawEllipse(head_x + 2, head_y - 5, 8, 10)
+        painter.drawEllipse(head_x + 18, head_y - 5, 8, 10)
+
+        # 眼睛 - 睁开
+        painter.setBrush(black)
+        eye_x = 8
+        painter.drawEllipse(head_x + eye_x, head_y + 8, 5, 5)
+        painter.drawEllipse(head_x + eye_x + 12, head_y + 8, 5, 5)
+
+        # 鼻子
+        painter.setBrush(black)
+        painter.drawEllipse(head_x + 10, head_y + 16, 6, 4)
+
+        # 嘴巴
+        painter.setBrush(QColor(200, 80, 80))
+        mouth_y = head_y + 20 if frame_idx % 2 == 0 else head_y + 22
+        painter.drawEllipse(head_x + 8, mouth_y, 12, 4)
+
+        # 条纹
+        painter.setBrush(black)
+        for i in range(3):
+            stripe_x = body_x + 8 + i * 12
+            painter.drawRect(stripe_x, body_y + 3, 4, 12)
+
+        # 尾巴
+        tail_base_x = body_x + body_w
+        tail_base_y = body_y + 10
+        tail_end_x = tail_base_x + 15 + (leg_off[0] if frame_idx % 2 == 0 else -leg_off[0])
+        tail_end_y = tail_base_y - 10 + (leg_off[1] if frame_idx % 2 == 0 else -leg_off[1])
+        pen = QPen(orange, 6)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(tail_base_x, tail_base_y, tail_end_x, tail_end_y)
+        # 尾巴条纹
+        painter.setBrush(black)
+        painter.drawEllipse(tail_end_x - 3, tail_end_y - 3, 6, 6)
+
+        # 腿（前腿和后腿）
+        painter.setBrush(orange)
+        painter.setPen(Qt.NoPen)
+        # 前腿
+        front_leg_x = body_x + 8
+        front_leg_y = body_y + body_h - 5
+        painter.drawRect(front_leg_x, front_leg_y + leg_off[1], 8, 15 - leg_off[1])
+        painter.drawRect(front_leg_x + 10, front_leg_y + leg_off[1] if frame_idx < 2 else 0, 8, 15)
+
+        # 后腿
+        back_leg_x = body_x + body_w - 15
+        back_leg_y = body_y + body_h - 5
+        painter.drawRect(back_leg_x, back_leg_y - leg_off[1], 8, 15 + leg_off[1])
+        painter.drawRect(back_leg_x + 10, back_leg_y - leg_off[1] if frame_idx >= 2 else 0, 8, 15)
+
+        # 爪子
+        painter.setBrush(white)
+        painter.drawRect(front_leg_x, front_leg_y + 12 + leg_off[1], 8, 4)
+        painter.drawRect(back_leg_x, back_leg_y + 12 - leg_off[1], 8, 4)
+
+        painter.end()
+        return image
+
+    def _draw_sleep_tiger(self):
+        """绘制睡眠老虎的静态图像"""
+        from PySide6.QtGui import QPainter, QColor, QPen
+
+        image = QImage(120, 80, QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        orange = QColor(245, 140, 50)
+        black = QColor(30, 30, 30)
+        white = QColor(255, 255, 255)
+
+        # 睡眠姿态：身体压低趴下
+        # 身体 - 更宽更矮
+        painter.setBrush(orange)
+        painter.setPen(Qt.NoPen)
+        body_x, body_y = 40, 40
+        body_w, body_h = 55, 25
+        painter.drawRoundedRect(body_x, body_y, body_w, body_h, 10, 10)
+
+        # 头部 - 更低
+        head_x, head_y = 20, 35
+        painter.drawEllipse(head_x, head_y, 30, 22)
+
+        # 耳朵
+        painter.drawEllipse(head_x + 3, head_y - 3, 8, 9)
+        painter.drawEllipse(head_x + 19, head_y - 3, 8, 9)
+
+        # 眼睛 - 闭眼（两条短线）
+        pen = QPen(black, 2)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        # 左眼
+        painter.drawLine(head_x + 8, head_y + 10, head_x + 14, head_y + 10)
+        # 右眼
+        painter.drawLine(head_x + 16, head_y + 10, head_x + 22, head_y + 10)
+
+        # 鼻子
+        painter.setBrush(black)
+        painter.drawEllipse(head_x + 11, head_y + 14, 6, 4)
+
+        # 嘴巴 - 微笑
+        painter.setBrush(QColor(200, 80, 80))
+        painter.drawEllipse(head_x + 9, head_y + 18, 10, 3)
+
+        # 条纹
+        painter.setBrush(black)
+        for i in range(3):
+            stripe_x = body_x + 10 + i * 14
+            painter.drawRect(stripe_x, body_y + 2, 4, 10)
+
+        # 尾巴 - 下垂
+        tail_base_x = body_x + body_w
+        tail_base_y = body_y + 8
+        pen = QPen(orange, 5)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(tail_base_x, tail_base_y, tail_base_x + 12, tail_base_y + 15)
+        # 尾巴头
+        painter.setBrush(black)
+        painter.drawEllipse(tail_base_x + 10, tail_base_y + 13, 5, 5)
+
+        # 腿 - 趴下姿势
+        painter.setBrush(orange)
+        painter.setPen(Qt.NoPen)
+        # 前腿
+        painter.drawRect(body_x + 5, body_y + body_h - 3, 10, 8)
+        # 后腿
+        painter.drawRect(body_x + body_w - 15, body_y + body_h - 3, 10, 8)
+
+        # 爪子
+        painter.setBrush(white)
+        painter.drawRect(body_x + 5, body_y + body_h + 3, 10, 4)
+        painter.drawRect(body_x + body_w - 15, body_y + body_h + 3, 10, 4)
+
+        painter.end()
+        return image
+
+    def _next_frame(self):
+        """切换到下一帧"""
+        self._frame = (self._frame + 1) % len(self._frames)
+        self.update()
+
+    def paintEvent(self, event):
+        """绘制当前帧"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        if self._is_running and self._frames:
+            painter.drawImage(self.rect(), self._frames[self._frame])
+        elif self._frame_sleeping:
+            painter.drawImage(self.rect(), self._frame_sleeping)
+
+    def mousePressEvent(self, event):
+        """点击恢复主窗口"""
+        if event.button() == Qt.LeftButton:
+            self.hide()
+            if hasattr(self, '_main_window'):
+                self._main_window.showNormal()
+                self._main_window.raise_()
+                self._main_window.activateWindow()
+
+    def contextMenuEvent(self, event):
+        """右键菜单，退出程序"""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: white;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 8px 20px;
+                border-radius: 4px;
+                color: #2d3748;
+            }
+            QMenu::item:selected {
+                background: #edf2f7;
+            }
+        """)
+        exit_action = menu.addAction("🐯 退出程序")
+        action = menu.exec(self.mapToGlobal(event.pos()))
+        if action == exit_action:
+            if hasattr(self, '_main_window'):
+                self._main_window.close()
+            QApplication.instance().quit()
+
+    def show_at_bottom_right(self):
+        """显示在屏幕右下角"""
+        screen = self._get_desktop_screen()
+        if screen:
+            geo = screen.geometry()
+            x = geo.right() - self.width() - 20
+            y = geo.bottom() - self.height() - 80
+            self.move(x, y)
+        self.show()
+
+    def _get_desktop_screen(self):
+        """获取主屏幕"""
+        from PySide6.QtWidgets import QApplication
+        screens = QApplication.instance().screens()
+        return screens[0] if screens else None
+
+
+# ==================== 进程监控线程 ====================
+class ProcessMonitor(QThread):
+    """
+    进程监控线程
+    - WPS/Office：监测进程启动/退出
+    - 浏览器：监测窗口是否存在（新标签页会创建/关闭窗口）
+    只有新启动的进程/窗口（非基线）才会触发奔跑状态
+    """
+    running = Signal()   # 有新进程或窗口启动
+    sleeping = Signal()  # 所有新进程/窗口退出
+
+    # 目标进程列表（统一大写）
+    OFFICE_PROCS = {'WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE'}
+    WPS_PROCS = {'WPS.EXE', 'ET.EXE', 'WPP.EXE'}
+    BROWSER_PROCS = {
+        'CHROME.EXE', 'MSEDGE.EXE', 'FIREFOX.EXE',
+        '360SE.EXE', 'LIEBAO.EXE', 'SOGOUEXPLORER.EXE'
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._stop_event = threading.Event()
+
+        # 进程基线
+        self._baseline_procs = set()       # 启动时已存在的非浏览器进程
+        self._baseline_browser_pids = set()  # 启动时已存在的浏览器进程PID
+        self._prev_new_browser_windows = False
+
+        # ctypes 用于 Windows API
+        self._ctypes = None
+        if sys.platform == 'win32':
+            import ctypes
+            self._ctypes = ctypes
+
+    def run(self):
+        """主循环：每秒检查一次"""
+        import psutil
+
+        # 建立基线
+        self._establish_baseline(psutil)
+
+        # 初始状态：睡眠
+        self._prev_new_browser_windows = False
+        self.sleeping.emit()
+
+        # 主循环
+        while not self._stop_event.is_set():
+            self._check(psutil)
+            self._stop_event.wait(1)
+
+    def _establish_baseline(self, psutil):
+        """建立基线：记录启动时已有的进程"""
+        current_procs = {p.info['name'].upper(): p.info.get('pid') for p in psutil.process_iter(['name', 'pid'])}
+
+        # WPS/Office 基线进程
+        for name in self.OFFICE_PROCS | self.WPS_PROCS:
+            if name in current_procs:
+                self._baseline_procs.add(name)
+
+        # 浏览器基线进程PID
+        for name in self.BROWSER_PROCS:
+            if name in current_procs:
+                self._baseline_browser_pids.add(current_procs[name])
+
+    def _check(self, psutil):
+        """检查进程和窗口变化"""
+        try:
+            # 检查 WPS/Office 新增进程
+            self._check_office_wps(psutil)
+
+            # 检查浏览器窗口
+            self._check_browser_windows()
+        except Exception as e:
+            print(f"进程检查异常: {e}")
+
+    def _check_office_wps(self, psutil):
+        """检查 WPS/Office 新增进程"""
+        current_procs = {p.info['name'].upper() for p in psutil.process_iter(['name'])}
+        target_procs = current_procs & (self.OFFICE_PROCS | self.WPS_PROCS)
+        new_procs = target_procs - self._baseline_procs
+
+        if new_procs:
+            self.running.emit()
+
+    def _check_browser_windows(self):
+        """检查浏览器窗口是否存在（通过窗口标题监测新标签页）"""
+        if not self._ctypes:
+            return
+
+        current_browser_pids = self._get_browser_pids()
+        new_browser_pids = current_browser_pids - self._baseline_browser_pids
+
+        # 检查新增浏览器进程是否有窗口
+        has_new_browser_window = False
+        if new_browser_pids:
+            has_new_browser_window = self._browser_has_window(new_browser_pids)
+
+        # 检测状态变化
+        if has_new_browser_window and not self._prev_new_browser_windows:
+            self.running.emit()
+        elif not has_new_browser_window and self._prev_new_browser_windows:
+            self.sleeping.emit()
+
+        self._prev_new_browser_windows = has_new_browser_window
+
+    def _get_browser_pids(self):
+        """获取当前运行的浏览器进程PID"""
+        import psutil
+        pids = set()
+        for proc in psutil.process_iter(['name', 'pid']):
+            if proc.info['name'].upper() in self.BROWSER_PROCS:
+                pids.add(proc.info['pid'])
+        return pids
+
+    def _browser_has_window(self, browser_pids):
+        """检查指定浏览器进程是否有窗口"""
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+
+            # 回调函数：检查窗口是否属于目标进程
+            found = [False]
+            def enum_callback(hwnd, _):
+                if not user32.IsWindowVisible(hwnd):
+                    return 1  # 继续枚举
+                pid = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value in browser_pids:
+                    found[0] = True
+                    return 0  # 停止枚举
+                return 1  # 继续枚举
+
+            # 枚举所有窗口
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+            user32.EnumWindows(EnumWindowsProc(enum_callback), None)
+
+            return found[0]
+        except Exception as e:
+            print(f"窗口检查异常: {e}")
+            return False
+
+    def stop(self):
+        """停止监控"""
+        self._stop_event.set()
 
 
 # ==================== AI 请求线程 ====================
@@ -1237,7 +1680,7 @@ class ChatWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI 聊天机器人 V0.4.3")
+        self.setWindowTitle("AI 聊天机器人 V0.4.4")
         self.resize(1200, 800)
         self.setMinimumSize(1000, 600)
 
@@ -1277,7 +1720,17 @@ class ChatWindow(QMainWindow):
         self.setWindowIcon(QIcon(icon_pixmap))
         
         self.setup_ui()
-        
+
+        # 创建小老虎组件
+        self.tiger_widget = TigerWidget()
+        self.tiger_widget._main_window = self
+
+        # 创建进程监控器
+        self.process_monitor = ProcessMonitor()
+        self.process_monitor.running.connect(lambda: self.tiger_widget.set_running_mode(True))
+        self.process_monitor.sleeping.connect(lambda: self.tiger_widget.set_running_mode(False))
+        self.process_monitor.start()
+
         # 加载历史对话
         if not self.load_conversations():
             # 如果没有历史，创建新对话
@@ -2236,18 +2689,46 @@ class ChatWindow(QMainWindow):
                 else:
                     self.create_new_conversation()
 
+    def changeEvent(self, event):
+        """检测窗口最小化事件"""
+        if event.type() == QEvent.WindowStateChange and self.isMinimized():
+            # 最小化时正常最小化到任务栏，不显示小老虎
+            pass
+        super().changeEvent(event)
+
     def closeEvent(self, event):
+        # 检查是否是从小老虎图标触发的退出
+        # 如果小老虎正在显示，说明用户点击了关闭按钮，需要最小化到小老虎
+        if hasattr(self, 'tiger_widget') and self.tiger_widget.isVisible():
+            # 小老虎正在显示，说明这是第二次close（真正退出）
+            # 执行正常清理
+            self.tiger_widget.hide()
+        else:
+            # 第一次关闭，最小化到小老虎
+            if hasattr(self, 'tiger_widget'):
+                self.hide()  # 隐藏主窗口
+                self.tiger_widget.show_at_bottom_right()
+            event.ignore()  # 阻止真正关闭
+            return
+
         if self._save_timer is not None:
             self._save_timer.stop()
             self._save_timer.deleteLater()
             self._save_timer = None
-        
+
         self.save_conversations(delay=False)
-        
+
         if self.api_worker and self.api_worker.isRunning():
             self.api_worker.stop()
             if not self.api_worker.wait(3000):
                 self.api_worker.terminate()
+
+        # 关闭进程监控线程
+        if hasattr(self, 'process_monitor') and self.process_monitor.isRunning():
+            self.process_monitor.stop()
+            if not self.process_monitor.wait(3000):
+                self.process_monitor.terminate()
+
         event.accept()
 
 
