@@ -1,6 +1,7 @@
 # AI Chat GUI
 
-一款Vibe Coding搓出来的简易ai聊天窗口界面，基于 PySide6 和 OpenAI SDK 制作，支持多模态输入、代码高亮和对话历史管理。
+一款 Vibe Coding 搓出来的简易 AI 聊天窗口界面，基于 PySide6 制作，**零 SDK 依赖**（纯标准库 HTTP 客户端），
+原生支持 **Anthropic Messages** 与 **OpenAI Responses** 两种 API 格式，内置 **Agent 工具调用**，还有一只会趴睡、奔跑、犯困的可爱小狗桌宠 🐶。
 
 ## ✨ 功能特性
 
@@ -8,36 +9,42 @@
 - 优雅的深色/浅色主题设计
 - 流畅的动画效果和圆角设计
 - 响应式布局，支持窗口缩放
-- 美观的渐变按钮和阴影效果
+
+### 🔌 双格式 API（无 SDK 依赖）
+- **Anthropic (Messages)**：`POST {Base URL}/v1/messages`，`x-api-key` + `anthropic-version` 认证
+- **OpenAI (Responses)**：`POST {Base URL}/responses`，`Bearer Token` 认证
+- 两种格式均为原生 **SSE 流式** 实现（`urllib` + 标准库 JSON），彻底移除 `openai` 包依赖
+- 多模态（图片）消息在两种格式间自动转换
+
+### 🤖 Agent 与工具调用
+- 输入框旁的 "🤖 Agent" 开关一键启用
+- 模型可调用 6 个工具：`read` / `write` / `edit` / `glob` / `grep` / `bash`（参考 nanocode 设计）
+- 完整 agentic 循环：模型请求工具 → 后台执行 → 结果回传 → 继续推理，直到任务完成
+- 工具调用以卡片形式展示在对话流中，点击可展开完整参数与输出
+- 写入/编辑/命令类工具默认需要用户确认（可在设置中关闭）
+- 工作目录可配置，所有相对路径基于该目录解析
 
 ### 💬 对话功能
-- 支持流式响应，实时显示AI回复
-- 对话历史管理（创建、重命名、删除）
-- 本地保存对话记录，支持会话恢复
+- 流式响应，实时显示 AI 回复
+- 对话历史管理（创建、重命名、删除），本地保存与会话恢复
 - 智能对话标题生成
 
 ### 📁 多模态输入
-- **文本输入**：支持 Markdown 格式和代码块
-- **图片上传**：支持 PNG、JPG、JPEG、BMP、GIF、WebP 格式
-- **文件上传**：支持代码文件（.py、.js、.html、.css 等）和文本文件
-- **多图支持**：可同时上传多张图片并预览
+- **文本输入**：Markdown 渲染与代码高亮
+- **图片上传**：PNG、JPG、JPEG、BMP、GIF、WebP，多图支持
+- **文件上传**：代码与文本文件自动包装为代码块
 
-### 🛠️ 代码处理
-- 智能代码块检测和语法高亮
-- 代码复制功能，一键复制代码内容
-- 行内代码和 Markdown 格式支持
-
-### ⚙️ API 兼容性
-- 支持任何兼容 OpenAI API 格式的接口
-- 可配置 Base URL 和模型名称
-- 多模态模型自动检测
-- 连接超时和错误处理机制
+### 🐶 小狗桌宠
+- 关闭主窗口时，一只可爱的小狗出现在桌面右下角
+- 多种自然动作：**坐着摇尾巴、散步、奔跑、犯困点头、趴睡（带 Zzz）、伸懒腰**，按随机节奏自动轮换
+- 与 AI 任务联动：发送消息后**托腮思考**（冒问号）、执行工具时**埋头刨地干活**、回答完成**跳跃庆祝**（撒星星）、出错时**垂耳冒汗**；检测到新程序启动时欢快奔跑
+- 可拖动到任意位置，点击恢复主窗口，右键菜单可退出
 
 ## 📦 安装部署
 
 ### 环境要求
 - Python 3.9 或更高版本
-- 兼容 OpenAI API 的 API Key（如 DeepSeek、GPT 等）
+- 一个兼容 Anthropic Messages 或 OpenAI Responses 格式的 API Key
 
 ### 安装步骤
 
@@ -48,91 +55,89 @@ cd ai-chat-gui
 ```
 2. **安装依赖**
 ```bash
-pip install openai pyside6 mistune pygments
+pip install -r requirements.txt
 ```
 3. **运行程序**
 ```bash
 python AIChat.py
 ```
 
+### 运行测试（可选）
+```bash
+QT_QPA_PLATFORM=offscreen python tests/offline_test.py
+```
+使用本地模拟 SSE 服务器离线验证双格式客户端与 Agent 循环，无需真实 API Key。
+
 ## 🔧 配置说明
 
-### API 设置
 首次运行需要在设置中配置 API 信息：
-1. 点击左侧面板的 "⚙️ API 设置" 按钮
-2. 填写以下信息：
-   - **API Key**: 你的 API 密钥
-   - **Base URL**: API 接口地址（如：`https://api.deepseek.com/v1`）
-   - **模型**: 模型名称（如：`deepseek-chat`）
-   - **多模态支持**: 如果你的模型支持图片输入，请勾选此选项
 
-### 支持的 API 服务
-- DeepSeek API
-- OpenAI API
-- 其他任何兼容 OpenAI API 格式的服务
+| 配置项 | 说明 | 示例 |
+|---|---|---|
+| API 格式 | Anthropic (Messages) 或 OpenAI (Responses) | — |
+| API Key | 你的 API 密钥 | `sk-...` |
+| Base URL | 服务地址（末尾自动补全端点路径） | `https://api.anthropic.com` / `https://api.openai.com/v1` |
+| 模型 | 模型名称 | `claude-sonnet-4-5` / `gpt-5` / `deepseek-chat` |
+| 多模态 | 模型是否支持图片输入 | 勾选 |
+| 工具工作目录 | Agent 工具的默认目录 | `D:\projects\demo` |
+| 工具确认 | 写入/编辑/命令前是否弹窗确认 | 默认开启 |
+
+### 常见服务的填法
+- **Anthropic 官方**：格式选 Anthropic，Base URL `https://api.anthropic.com`
+- **OpenAI 官方**：格式选 Responses，Base URL `https://api.openai.com/v1`
+- **DeepSeek（Anthropic 兼容端点）**：格式选 Anthropic，Base URL `https://api.deepseek.com/anthropic`
+- **其他兼容服务**：按服务方文档填写；若 Base URL 已以 `/messages` 或 `/responses` 结尾则不会重复追加
 
 ## 🖥️ 使用指南
 
 ### 基本使用
-1. **新建对话**：点击左侧面板的 "➕ 新建对话" 按钮
-2. **发送消息**：
-   - 在底部输入框输入文本
-   - 按 `Enter` 发送，`Shift+Enter` 换行
-3. **上传文件**：
-   - 点击输入框旁的 "📎" 按钮
-   - 支持多选图片和文本文件
-   - 图片会自动显示预览
+1. **新建对话**：点击左侧面板的 "➕ 新建对话"
+2. **发送消息**：输入框输入文本，`Enter` 发送，`Shift+Enter` 换行
+3. **上传文件**：点击 "📎" 按钮多选图片或文本文件
+
+### Agent 模式
+1. 点击输入框旁的 **"🤖 Agent"** 按钮开启（按钮变绿）
+2. 像平时一样对话，例如：
+   - "看看当前目录有什么文件，把 README 里的版本号改成 2.0"
+   - "写一个 fizzbuzz.py 并运行它"
+3. 工具调用会以卡片出现在对话流中，点击卡片可展开参数与结果
+4. 默认在执行 `write` / `edit` / `bash` 前会弹窗询问（设置中可改为自动执行）
 
 ### 对话管理
-- **切换对话**：点击左侧列表中的对话项
-- **重命名对话**：右键点击对话 → "重命名"
-- **删除对话**：右键点击对话 → "删除"
-- **清除历史**：点击左下角的 "🗑️ 清除所有历史"
-
-### 代码处理
-- **代码块**：使用三个反引号包裹代码（支持语言标识）
-- **行内代码**：使用单个反引号包裹 `code`
-- **复制代码**：点击代码块右上角的 "📋 复制" 按钮
-
-### 多模态功能
-1. **上传图片**：支持拖放或通过文件对话框选择
-2. **图片预览**：上传的图片会在输入框上方显示缩略图
-3. **移除图片**：点击图片缩略图上的 "✕" 按钮
-4. **多图输入**：可同时上传最多 10 张图片
+- **切换/重命名/删除**：点击或右键左侧列表项
+- **清除历史**：左下角 "🗑️ 清除所有历史"
 
 ## 📁 项目结构
+
+```
 ai-chat-gui/
-
-├── AIChat.py # 主程序文件
-
-├── README.md # 项目说明文档
-
-├── requirements.txt # 依赖包列表
-
-└── ~/.aichat/ # 用户数据目录（自动创建）
-
-└── conversations.json # 对话历史文件
+├── AIChat.py              # 启动入口
+├── aichat/
+│   ├── api.py             # 双格式 API 客户端（urllib + SSE 流式）
+│   ├── agent.py           # 工具集 + AgentWorker agentic 循环
+│   ├── pet.py             # 小狗桌宠（多动作状态机 + QPainter 绘制）
+│   ├── widgets.py         # Markdown/消息/代码块/工具调用组件
+│   ├── window.py          # 主窗口、设置、进程监控
+│   └── app.py             # QApplication 入口
+├── tests/
+│   └── offline_test.py    # 离线端到端测试（模拟 SSE 服务器）
+├── nanocode.py            # Agent 设计参考（极简 CLI 版）
+└── ~/.aichat/conversations.json   # 用户数据（自动创建）
+```
 
 ## 🛠️ 技术实现
 
 ### 核心架构
 - **UI 框架**: PySide6 (Qt for Python)
-- **API 客户端**: OpenAI Python SDK
-- **数据存储**: JSON 格式本地存储
-- **异步处理**: QThread 实现后台 API 调用
+- **API 客户端**: Python 标准库 `urllib`（零第三方 SDK），SSE 事件流解析
+- **Agent 循环**: QThread 后台执行「模型 ↔ 工具」迭代，信号驱动 UI 更新
+- **数据存储**: JSON 格式本地存储（内部消息格式统一为 Anthropic 风格内容块，旧版历史自动迁移）
 
 ### 关键特性实现
-1. **流式响应**: 使用 OpenAI 的流式 API，实时更新回复内容
-2. **代码高亮**: 解析代码块，自定义 CodeBlockWidget 渲染
-3. **多模态处理**: Base64 编码图片，根据模型支持自动调整消息格式
-4. **防抖优化**: 使用 QTimer 实现高度调整防抖，提升性能
-5. **错误处理**: 完善的异常捕获和用户友好提示
-
-### 性能优化
-- 控件复用减少内存占用
-- 延迟保存避免频繁 I/O 操作
-- 防抖机制防止界面卡顿
-- 连接池管理避免资源泄漏
+1. **双格式流式**：Anthropic `content_block_delta` 与 OpenAI `response.output_text.delta` 统一为 `on_text` 回调；工具调用在流结束后以完整形态返回
+2. **消息转换**：内部 Anthropic 风格块 ↔ Responses items（`function_call` / `function_call_output` / `input_image`）双向转换
+3. **工具安全**：危险工具确认机制跨线程同步（`threading.Event`）；工具输出截断保护上下文
+4. **桌宠动画**：单计时器 30fps 驱动，参数化 QPainter 绘制十种姿态，状态机随机轮换 + AI 任务状态联动
 
 ## 🐛 常见问题
 
@@ -140,16 +145,13 @@ ai-chat-gui/
 **A**: 检查 Python 版本和依赖安装
 
 ### Q: API 请求失败
-**A**: 
-1. 检查 API Key 和 Base URL 是否正确
-2. 确认网络连接正常
-3. 查看模型名称是否正确
-
-### Q: 图片上传失败
 **A**:
-1. 确认模型是否支持多模态
-2. 检查图片格式和大小
-3. 在设置中勾选 "此模型支持图片输入"
+1. 检查 API 格式是否与服务匹配（Anthropic 端点用 Messages 格式，OpenAI 端点用 Responses 格式）
+2. 检查 API Key 和 Base URL 是否正确
+3. 确认模型名称已正确填写
+
+### Q: Agent 模式下模型不调用工具
+**A**: 部分模型不支持工具调用；确认所填模型具备 tool use 能力。
 
 ## 📜 开源协议
 
