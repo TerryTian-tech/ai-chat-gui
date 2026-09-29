@@ -1298,6 +1298,9 @@ class ChatWindow(QMainWindow):
                 self.puppy_widget.hide()
             self._do_exit_cleanup()
             event.accept()
+            # 主窗口此时通常是隐藏状态（已最小化为桌宠），close() 一个隐藏窗口
+            # 不会触发 Qt 的"最后窗口关闭即退出"机制，必须显式退出事件循环
+            QApplication.quit()
             return
 
         if hasattr(self, 'puppy_widget'):
