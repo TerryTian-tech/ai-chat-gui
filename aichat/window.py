@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
 )
 
 from .agent import AgentWorker
-from .api import (ANTHROPIC, FORMAT_LABELS, RESPONSES, THINKING_HIGH,
-                  THINKING_LOW, THINKING_MEDIUM, THINKING_OFF,
-                  normalize_history_message, normalize_thinking_effort)
+from .api import (ANTHROPIC, CONTEXT_PRESETS, FORMAT_LABELS, RESPONSES,
+                  THINKING_HIGH, THINKING_LOW, THINKING_MEDIUM, THINKING_OFF,
+                  normalize_context_preset, normalize_history_message,
+                  normalize_thinking_effort)
 from . import __version__ as _pkg_version
 from .pet import PuppyWidget
 from .widgets import MessageWidget
@@ -97,6 +98,19 @@ class SettingsDialog(QDialog):
             "模型不支持思考时自动去掉思考参数重试；输出上限不足时自动收紧 max_tokens。")
         self._style_combo(self.thinking_combo)
         form.addWidget(self.thinking_combo)
+
+        form.addWidget(QLabel("上下文档位:"))
+        self.context_combo = QComboBox()
+        self.context_combo.addItem("128K（历史预算 10 万字符）", "128k")
+        self.context_combo.addItem("200K（历史预算 16 万字符）", "200k")
+        self.context_combo.addItem("1M（历史预算 80 万字符）", "1m")
+        self.context_combo.setToolTip(
+            "按所用模型的上下文窗口选择档位。\n"
+            "请求携带的历史超过预算时，最旧的完整轮次不随请求发送\n"
+            "（本地会话存档不受影响）。选大了会撑爆小上下文模型，\n"
+            "选小了只是浪费长上下文能力。")
+        self._style_combo(self.context_combo)
+        form.addWidget(self.context_combo)
 
         self.vision_checkbox = QCheckBox("此模型支持图片输入（多模态）")
         self.vision_checkbox.setStyleSheet("font-size: 13px; color: #4a5568;")
@@ -193,6 +207,9 @@ class SettingsDialog(QDialog):
         effort_idx = self.thinking_combo.findData(
             normalize_thinking_effort(settings.value("thinking_effort", THINKING_OFF)))
         self.thinking_combo.setCurrentIndex(max(effort_idx, 0))
+        ctx_idx = self.context_combo.findData(
+            normalize_context_preset(settings.value("context_preset", "1m")))
+        self.context_combo.setCurrentIndex(max(ctx_idx, 0))
         self.vision_checkbox.setChecked(settings.value("supports_vision", False, type=bool))
         self.workdir_edit.setText(settings.value("workdir", ""))
         self.confirm_checkbox.setChecked(settings.value("confirm_tools", True, type=bool))
@@ -204,6 +221,7 @@ class SettingsDialog(QDialog):
         settings.setValue("base_url", self.base_url_edit.text())
         settings.setValue("model", self.model_edit.text())
         settings.setValue("thinking_effort", self.thinking_combo.currentData())
+        settings.setValue("context_preset", self.context_combo.currentData())
         settings.setValue("supports_vision", self.vision_checkbox.isChecked())
         settings.setValue("workdir", self.workdir_edit.text())
         settings.setValue("confirm_tools", self.confirm_checkbox.isChecked())
@@ -223,6 +241,7 @@ class SettingsDialog(QDialog):
             "base_url": self.base_url_edit.text(),
             "model": self.model_edit.text(),
             "thinking_effort": self.thinking_combo.currentData(),
+            "context_preset": self.context_combo.currentData(),
             "supports_vision": self.vision_checkbox.isChecked(),
             "workdir": self.workdir_edit.text(),
             "confirm_tools": self.confirm_checkbox.isChecked(),
@@ -381,6 +400,9 @@ class ChatWindow(QMainWindow):
         # 已取消但线程尚未结束的 worker：QThread 运行中销毁会 qFatal 直接退出进程，
         # 必须暂存引用，等 finished 后再释放
         self._retiring_workers: List[AgentWorker] = []
+        # 每个会话的请求序号：取消回写（可能晚到）据此判断自己是否仍是最新请求，
+        # 防止旧请求的半轮快照覆盖新请求已写入的历史
+        self._conv_seqs: Dict[str, int] = {}
 
         settings = QSettings("MyChatApp", "Settings")
         self.api_format = settings.value("api_format", ANTHROPIC)
@@ -391,6 +413,8 @@ class ChatWindow(QMainWindow):
         self.model = settings.value("model", "")
         self.thinking_effort = normalize_thinking_effort(
             settings.value("thinking_effort", THINKING_OFF))
+        self.context_preset = normalize_context_preset(
+            settings.value("context_preset", "1m"))
         self.supports_vision = settings.value("supports_vision", False, type=bool)
         self.workdir = settings.value("workdir", "")
         self.confirm_tools = settings.value("confirm_tools", True, type=bool)
@@ -690,6 +714,7 @@ class ChatWindow(QMainWindow):
             self.base_url = s["base_url"]
             self.model = s["model"]
             self.thinking_effort = normalize_thinking_effort(s["thinking_effort"])
+            self.context_preset = normalize_context_preset(s["context_preset"])
             self.supports_vision = s["supports_vision"]
             self.workdir = s["workdir"]
             self.confirm_tools = s["confirm_tools"]
@@ -853,6 +878,7 @@ class ChatWindow(QMainWindow):
         if self.api_worker is not None:
             worker = self.api_worker
             cid = self._request_conversation_id
+            seq = self._conv_seqs.get(cid) if cid else None
             self.api_worker = None
             if worker.isRunning():
                 worker.stop()
@@ -868,9 +894,11 @@ class ChatWindow(QMainWindow):
                 except (RuntimeError, TypeError):
                     pass
                 # 保留最后一次历史回写：被截断的半轮内容也要落盘，
-                # 否则屏幕上已显示的正文/工具卡在重新加载后消失
+                # 否则屏幕上已显示的正文/工具卡在重新加载后消失。
+                # 携带请求序号：若此后同一会话又发起了新请求，晚到的旧快照作废
                 worker.history_ready.connect(
-                    lambda msgs, cid=cid: self._on_cancelled_history(cid, msgs))
+                    lambda msgs, cid=cid, seq=seq:
+                        self._on_cancelled_history(cid, msgs, seq))
                 # stop() 只是异步置位，线程此刻往往仍阻塞在流读取/退避等待中；
                 # 直接丢引用会销毁运行中的 QThread（qFatal 杀进程）。
                 # 暂存到回收列表，等 finished 后再释放。
@@ -903,8 +931,13 @@ class ChatWindow(QMainWindow):
         self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
         self._set_requesting_state(False)
 
-    def _on_cancelled_history(self, cid, messages):
-        """取消后 worker 的最后回写：把已生成的半轮内容落盘到原会话"""
+    def _on_cancelled_history(self, cid, messages, seq=None):
+        """取消后 worker 的最后回写：把已生成的半轮内容落盘到原会话。
+
+        晚到的回写（worker 曾卡在慢流/退避里）若发现该会话已发起新请求
+        （序号已变），必须放弃——旧快照会抹掉新请求写入的消息"""
+        if seq is not None and self._conv_seqs.get(cid) != seq:
+            return
         if cid and cid in self.conversations:
             self.conversations[cid]['messages'] = messages
             self.save_conversations()
@@ -1086,6 +1119,9 @@ class ChatWindow(QMainWindow):
 
         conversation = self.conversations[self.current_conversation_id]
         conversation['messages'].append({"role": "user", "content": message_content})
+        # 请求序号 +1：此后该会话的取消回写只有仍携带此序号才允许落盘
+        self._conv_seqs[self.current_conversation_id] = \
+            self._conv_seqs.get(self.current_conversation_id, 0) + 1
         self.add_message_widget("user", display_text, current_images_for_display)
         self.scroll_to_bottom()
 
@@ -1114,6 +1150,7 @@ class ChatWindow(QMainWindow):
             workdir=self.workdir or os.getcwd(),
             confirm_tools=self.confirm_tools,
             thinking_effort=self.thinking_effort,
+            context_chars=CONTEXT_PRESETS[self.context_preset],
         )
         self.api_worker.stream_chunk.connect(self.on_stream_chunk)
         self.api_worker.thinking_chunk.connect(self.on_thinking_chunk)
@@ -1196,12 +1233,6 @@ class ChatWindow(QMainWindow):
                 decided.append(ok)
                 approver.decide(ok)
 
-        def on_finished(_result):
-            # ESC / 关闭 / 停止取消等路径：尚未决定则一律按拒绝处理
-            decide_once(False)
-            if self._confirm_box is box:
-                self._confirm_box = None
-
         # 注意：不能连按钮的 clicked——QMessageBox 内部先于自定义槽触发
         # accept()/reject()，会导致 finished 的兜底拒绝抢占 decided 名额；
         # accepted/rejected 语义正好覆盖"是/否/ESC/关闭"全部路径
@@ -1209,6 +1240,9 @@ class ChatWindow(QMainWindow):
         box.rejected.connect(lambda: decide_once(False))
 
         def on_finished(_result):
+            # 兜底：任何未经 accept/reject 的关闭路径也按拒绝处理
+            # （防重复由 decided 保证；若对话框被异常销毁，worker 不会干等到超时）
+            decide_once(False)
             if self._confirm_box is box:
                 self._confirm_box = None
 
@@ -1441,6 +1475,10 @@ class ChatWindow(QMainWindow):
             if not worker.wait(3000):
                 worker.terminate()
         self._retiring_workers.clear()
+
+        # worker 的取消回写可能晚于上面的首次保存（走的是延时保存，
+        # 而事件循环即将退出），退出前再同步落盘一次
+        self.save_conversations(delay=False)
 
         if hasattr(self, 'process_monitor') and self.process_monitor.isRunning():
             self.process_monitor.stop()

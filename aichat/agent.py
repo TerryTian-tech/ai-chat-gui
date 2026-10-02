@@ -323,7 +323,8 @@ class AgentWorker(QThread):
 
     def __init__(self, messages, fmt, api_key, base_url, model,
                  agent_mode=False, workdir=".", confirm_tools=True,
-                 thinking_effort="off", system_prompt=SYSTEM_PROMPT):
+                 thinking_effort="off", context_chars=None,
+                 system_prompt=SYSTEM_PROMPT):
         super().__init__()
         self.messages = copy.deepcopy(messages)
         self.fmt = fmt
@@ -334,6 +335,7 @@ class AgentWorker(QThread):
         self.workdir = workdir
         self.confirm_tools = confirm_tools
         self.thinking_effort = thinking_effort
+        self.context_chars = context_chars
         self.system_prompt = system_prompt
         self._running = True
         self._pending_approver = None  # 正在等待用户确认的工具批准器
@@ -371,7 +373,7 @@ class AgentWorker(QThread):
 
     def _run_loop(self):
         client = make_client(self.fmt, self.api_key, self.base_url, self.model,
-                             self.thinking_effort)
+                             self.thinking_effort, self.context_chars)
         system = self.system_prompt
         tools = make_tool_schema() if self.agent_mode else None
         if self.agent_mode:

@@ -553,6 +553,250 @@ def test_interrupted_half_round():
         shutil.rmtree(hist_dir, ignore_errors=True)
 
 
+def test_output_cap_cache():
+    print("\n[3.17] 输出上限按模型缓存（不再每次白挨 400）")
+    from aichat.api import _OUTPUT_CAPS, AnthropicClient
+    _OUTPUT_CAPS.clear()
+
+    class CapHandler(BaseHTTPRequestHandler):
+        """max_tokens 超过 64000 就拒绝（模拟小输出上限模型）"""
+        protocol_version = "HTTP/1.1"
+        calls = []
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            type(self).calls.append((self.path, body))
+            if body.get("max_tokens", 0) > 64000:
+                payload = json.dumps({"error": {"message":
+                    "max_tokens: 393216 > 64000, which is the maximum allowed "
+                    "number of output tokens"}}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            sse = anth_events([("text", "ok")])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            data = sse.encode("utf-8")
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CapHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        CapHandler.calls.clear()
+        AnthropicClient("k", base, "model-a", "off").stream(
+            [{"role": "user", "content": "hi"}], "s")
+        AnthropicClient("k", base, "model-a", "off").stream(
+            [{"role": "user", "content": "hi"}], "s")
+        caps = [b.get("max_tokens") for _, b in CapHandler.calls]
+        check("cap 缓存: 第二次请求直接带上收紧值（3 次请求而非 4 次）",
+              len(CapHandler.calls) == 3 and caps == [393216, 64000, 64000], str(caps))
+        check("cap 缓存: 按 (base_url, model) 记录",
+              _OUTPUT_CAPS.get((base, "model-a")) == 64000)
+        CapHandler.calls.clear()
+        AnthropicClient("k", base, "model-b", "off").stream(
+            [{"role": "user", "content": "hi"}], "s")
+        caps = [b.get("max_tokens") for _, b in CapHandler.calls]
+        check("cap 缓存: 换模型重新探测", len(caps) == 2 and caps == [393216, 64000], str(caps))
+    finally:
+        server.shutdown()
+        _OUTPUT_CAPS.clear()
+
+
+def test_parse_output_cap_patterns():
+    print("\n[3.18] 输出上限报错解析（措辞覆盖 + 防误判）")
+    from aichat.api import ApiError, _parse_output_cap
+    sent = 384 * 1024
+    cases = [
+        ("max_tokens: 393216 > 64000, which is the maximum allowed number of output tokens",
+         64000),
+        ("max_tokens is too large: 393216. This model supports at most 4096", 4096),
+        ("max_tokens must be less than or equal to 4096", 4096),
+        ("Maximum allowed output tokens is 8192", 8192),
+        # 上下文长度不是输出上限，绝不能误判
+        ("This model's maximum context length is 128000 tokens, max_tokens too large", None),
+        ("max_tokens must be less than or equal to 1", None),  # 数值不可信（< 1024）
+        ("rate limited", None),                                # 与输出无关
+    ]
+    for msg, want in cases:
+        got = _parse_output_cap(ApiError(msg), sent)
+        check(f"解析: {msg[:38]}… → {want}", got == want, f"got {got}")
+
+
+def test_prompt_too_long_halving():
+    print("\n[3.19] prompt 超长自动减半上下文窗口重试")
+    from aichat.api import AnthropicClient
+
+    class PromptTooLongHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        calls = []
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            type(self).calls.append((self.path, body))
+            if len(type(self).calls) == 1:
+                payload = json.dumps({"error": {"message":
+                    "prompt is too long: 3000 tokens > 2000 maximum"}}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            sse = anth_events([("text", "窗口收敛")])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            data = sse.encode("utf-8")
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PromptTooLongHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        PromptTooLongHandler.calls.clear()
+        msgs = []
+        for i in range(6):
+            msgs.append({"role": "user", "content": f"问题{i}" + "字" * 190})
+            msgs.append({"role": "assistant", "content": f"回答{i}" + "字" * 190})
+        client = AnthropicClient("k", f"http://127.0.0.1:{server.server_address[1]}",
+                                 "m", "off", context_chars=2000)
+        texts = []
+        client.stream(msgs, "s", on_text=texts.append)
+        bodies = [b for _, b in PromptTooLongHandler.calls]
+        check("prompt 超长: 首请求按 2000 字符预算裁剪",
+              len(bodies[0]["messages"]) < len(msgs),
+              f"{len(bodies[0]['messages'])}/{len(msgs)}")
+        check("prompt 超长: 减半后窗口更小且请求成功",
+              len(bodies[1]["messages"]) < len(bodies[0]["messages"])
+              and "".join(texts) == "窗口收敛",
+              f"{len(bodies[0]['messages'])} → {len(bodies[1]['messages'])}")
+    finally:
+        server.shutdown()
+
+
+def test_cancel_writeback_race():
+    print("\n[3.20] 取消回写不覆盖新请求的历史")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from aichat.window import ChatWindow
+
+    class SlowFirstHandler(BaseHTTPRequestHandler):
+        """第 1 个 POST：先吐半轮文本再停顿 2.5s；之后的 POST：立即完整回复"""
+        protocol_version = "HTTP/1.1"
+        calls = []
+
+        def log_message(self, *args):
+            pass
+
+        def _write_chunk(self, text):
+            piece = text.encode("utf-8")
+            self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+            self.wfile.flush()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            type(self).calls.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            if len(type(self).calls) == 1:
+                part1 = "\r\n".join([
+                    "event: message_start",
+                    'data: {"type":"message_start","message":{"id":"m","role":"assistant","content":[]}}',
+                    "",
+                    "event: content_block_start",
+                    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                    "",
+                    "event: content_block_delta",
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"第一条的一半"}}',
+                    "",
+                ]) + "\r\n"
+                self._write_chunk(part1)
+                time.sleep(2.5)
+                part2 = "\r\n".join([
+                    "event: content_block_stop",
+                    'data: {"type":"content_block_stop","index":0}',
+                    "",
+                    "event: message_delta",
+                    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+                    "",
+                    "event: message_stop",
+                    'data: {"type":"message_stop"}',
+                    "",
+                ])
+                self._write_chunk(part2)
+            else:
+                self._write_chunk(anth_events([("text", "第二条的回答")]))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowFirstHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    SlowFirstHandler.calls.clear()
+
+    hist_dir = tempfile.mkdtemp(prefix="aichat_hist4_")
+    ChatWindow.HISTORY_DIR = hist_dir
+    ChatWindow.HISTORY_FILE = os.path.join(hist_dir, "conversations.json")
+    win = ChatWindow()
+    try:
+        win.api_format, win.api_key = "anthropic", "sk-test"
+        win.base_url, win.model = f"http://127.0.0.1:{server.server_address[1]}", "m"
+        win.thinking_effort = "off"
+        cid = win.current_conversation_id
+
+        win.input_edit.setPlainText("第一条")
+        win.send_message()
+        time.sleep(0.4)          # 半轮已流式显示
+        win._stop_generation()   # worker1 取消（其回写将在 ~2.5s 后晚到）
+        win.input_edit.setPlainText("第二条")
+        win.send_message()       # 立即发起新请求
+
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            app.processEvents()
+            if len(SlowFirstHandler.calls) >= 2 and not win._retiring_workers:
+                break
+            time.sleep(0.05)
+        time.sleep(3.0)  # 确保 worker1 的晚到回写已经发生并被拒收
+        for _ in range(30):
+            app.processEvents()
+            time.sleep(0.05)
+        result = win.conversations[cid]['messages']
+        check("竞态: 新请求的历史不被旧回写覆盖",
+              len(result) == 3
+              and result[0]["content"] == "第一条"
+              and result[1]["content"] == "第二条"
+              and isinstance(result[2].get("content"), list)
+              and any(b.get("type") == "text" and "第二条的回答" in b.get("text", "")
+                      for b in result[2]["content"]),
+              str(result)[:300])
+    finally:
+        win.process_monitor.stop()
+        win.process_monitor.wait(2000)
+        server.shutdown()
+        shutil.rmtree(hist_dir, ignore_errors=True)
+
+
 def test_api_clients(base):
     print("\n[1] API 客户端直连（双格式流式 + 工具调用组装）")
     from aichat.api import AnthropicClient, ResponsesClient, ApiError
@@ -939,7 +1183,8 @@ def test_thinking_support(base):
 
 def test_thinking_degrade():
     print("\n[3.5] 思考参数被拒的降级保护（空 content 占位 + 自动重试一次）")
-    from aichat.api import MAX_TOKENS, AnthropicClient, ResponsesClient, ApiError
+    from aichat.api import _OUTPUT_CAPS, MAX_TOKENS, AnthropicClient, ResponsesClient, ApiError
+    _OUTPUT_CAPS.clear()  # 与其他降级用例隔离缓存
 
     # 空 content 占位：思考阶段被截断的回合（只有 thinking 块），关档位剥离后不再产生空数组
     stripped = AnthropicClient._strip_thinking({"role": "assistant", "content": [
@@ -958,8 +1203,10 @@ def test_thinking_degrade():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     dbase = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        # --- Anthropic：高档位撞 8192 输出上限 → 400 → 去掉思考参数重试一次 ---
+        # --- Anthropic：纯思考拒绝消息 → 400 → 去掉思考参数重试一次 ---
+        # （消息不含 max_tokens/输出字样，不走收紧路径，专测思考降级）
         FailFirstHandler.calls.clear()
+        FailFirstHandler.error_message = "thinking is not supported by this model"
         texts = []
         AnthropicClient("k", dbase, "m", "high").stream(
             [{"role": "user", "content": "hi"}], "s", on_text=texts.append)
@@ -1021,6 +1268,7 @@ def test_thinking_degrade():
         check("anthropic: 思考截断历史 → 占位文本块而非空 content",
               a_content == [{"type": "text", "text": "[thinking omitted]"}], str(a_content))
     finally:
+        _OUTPUT_CAPS.clear()
         FailFirstHandler.error_message = "thinking is not supported by this model"
         FailFirstHandler.fail_count = 1
         server.shutdown()
@@ -1119,13 +1367,14 @@ def test_retry_backoff():
 
 def test_output_limit_clamp():
     print("\n[3.7b] max_tokens 超限自动收紧（按服务端上报的上限重试）")
-    from aichat.api import AnthropicClient, ApiError
+    from aichat.api import _OUTPUT_CAPS, AnthropicClient, ApiError
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), FailFirstHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         # 上限装得下思考预算：收紧 max_tokens、保留思考参数
+        _OUTPUT_CAPS.clear()  # 四个用例共用 (base, "m") 缓存键，必须逐用例隔离
         FailFirstHandler.calls.clear()
         FailFirstHandler.error_messages = [
             "max_tokens: 393216 > 64000, which is the maximum allowed number of output tokens"]
@@ -1141,6 +1390,7 @@ def test_output_limit_clamp():
               f"{second['max_tokens']} / {second.get('thinking')}")
 
         # 上限装不下思考预算（高档 budget+4096=20480 > 20000）：连思考一起去掉
+        _OUTPUT_CAPS.clear()
         FailFirstHandler.calls.clear()
         FailFirstHandler.error_messages = [
             "max_tokens: 393216 > 20000, which is the maximum allowed number of output tokens"]
@@ -1153,6 +1403,7 @@ def test_output_limit_clamp():
               f"{second['max_tokens']} / {second.get('thinking')}")
 
         # 两段式：先超限、收紧后思考仍被拒 → 再去掉思考
+        _OUTPUT_CAPS.clear()
         FailFirstHandler.calls.clear()
         FailFirstHandler.error_messages = [
             "max_tokens: 393216 > 64000, which is the maximum allowed number of output tokens",
@@ -1170,6 +1421,7 @@ def test_output_limit_clamp():
               str([(b.get("max_tokens"), b.get("thinking")) for _, b in FailFirstHandler.calls]))
 
         # 与 max_tokens 无关的 400 不触发收紧
+        _OUTPUT_CAPS.clear()
         FailFirstHandler.calls.clear()
         FailFirstHandler.error_messages = ["invalid x-api-key"]
         FailFirstHandler.fail_count = 1
@@ -1181,6 +1433,7 @@ def test_output_limit_clamp():
             check("anthropic: 无关 400 不触发收紧重试",
                   len(FailFirstHandler.calls) == 1 and "invalid" in str(e), str(e))
     finally:
+        _OUTPUT_CAPS.clear()
         FailFirstHandler.error_messages = []
         FailFirstHandler.fail_count = 1
         server.shutdown()
@@ -1600,8 +1853,9 @@ def test_ui(workdir):
           and "已中断" in wm._all_text_browsers[-1].toPlainText(),
           str([b.toPlainText() for b in wm._all_text_browsers]))
 
-    # 桌宠隐藏时暂停 30fps 动画定时器，显示时恢复
+    # 桌宠隐藏时暂停 30fps 动画定时器，显示时恢复；初始不可见不空转
     pw = win.puppy_widget
+    check("桌宠: 初始不可见时定时器不空转", not pw._timer.isActive())
     pw.show()
     pw.hide()
     check("桌宠: 隐藏时暂停动画定时器", not pw._timer.isActive())
@@ -1664,6 +1918,12 @@ def test_ui(workdir):
           dlg.get_settings()["thinking_effort"] == "high")
     dlg.thinking_combo.setCurrentIndex(0)
     check("设置对话框: 关闭档位为 off", dlg.get_settings()["thinking_effort"] == "off")
+    check("设置对话框: 上下文档位下拉含 3 档", dlg.context_combo.count() == 3)
+    dlg.context_combo.setCurrentIndex(0)
+    check("设置对话框: get_settings 携带 context_preset",
+          dlg.get_settings()["context_preset"] == "128k")
+    dlg.context_combo.setCurrentIndex(2)
+    check("设置对话框: 1M 档位", dlg.get_settings()["context_preset"] == "1m")
 
     # 保存/加载往返
     win.save_conversations(delay=False)
@@ -1690,9 +1950,13 @@ def main():
         test_ui(workdir)          # 先建 QApplication，供后续 QThread 使用
         test_stop_generation()
         test_interrupted_half_round()
+        test_cancel_writeback_race()
         test_empty_blocks_guard()
         test_sse_flush()
         test_interruptible_backoff()
+        test_output_cap_cache()
+        test_parse_output_cap_patterns()
+        test_prompt_too_long_halving()
         test_api_clients(base)
         test_api_block_start_input()
         test_agent_worker(base, workdir)

@@ -67,6 +67,25 @@ _MAX_OPEN_ATTEMPTS = 3
 # 只裁剪请求，不动本地历史存档；按完整轮次边界裁剪，保证 tool_use/tool_result 配对完整
 CONTEXT_CHAR_LIMIT = 800_000
 
+# 上下文档位（设置界面可选）→ 请求携带的历史字符预算。
+# token→字符按中文最坏情况 1:1 换算并预留输出与误差余量
+CONTEXT_PRESETS = {
+    "128k": 100_000,
+    "200k": 160_000,
+    "1m": 800_000,
+}
+# prompt 超长减半重试的窗口下限（低于此值不再减半，直接报错）
+_MIN_CONTEXT_CHARS = 25_000
+
+# 服务端输出上限缓存：(base_url, model) → 解析出的 max_tokens 上限。
+# 避免每次请求都先用 384K 撞一次 400（agent 循环 20 轮就是 20 次浪费）
+_OUTPUT_CAPS = {}
+
+
+def normalize_context_preset(preset) -> str:
+    """把外部传入的上下文档位归一化到合法档位（未知值回退为 1m）"""
+    return preset if preset in CONTEXT_PRESETS else "1m"
+
 
 def _retry_delay(http_error, default_delay: float) -> float:
     """重试等待秒数：优先用服务端的 Retry-After，夹在 [1, 30] 区间"""
@@ -77,24 +96,41 @@ def _retry_delay(http_error, default_delay: float) -> float:
     return min(max(wait, 1.0), 30.0)
 
 
+# 服务端输出上限的报错措辞（按优先级排列；避免裸 "maximum" —— 会把
+# "maximum context length is 128000" 的上下文长度误当输出上限）
+_OUTPUT_CAP_PATTERNS = (
+    r"max_tokens[^>]{0,60}>\s*(\d+)",   # Anthropic: max_tokens: 393216 > 64000
+    r"(?:at most|less than or equal to|no more than|up to|maximum allowed|maximum of)"
+    r"[^\d]{0,40}?(\d+)",
+)
+
+
 def _parse_output_cap(error, sent_limit):
     """从 400 错误消息中解析服务端允许的最大输出 token 数。
 
-    仅当消息明确指向 max_tokens 超限（含上限数值、且小于我方发送值）时
-    返回该上限，否则返回 None（不是超限错误，不触发收紧重试）。
-    Anthropic 形如 "max_tokens: 393216 > 64000, ..."，网关多为
-    "Maximum allowed is 64000" 一类。"""
+    仅当消息明确指向输出上限超限、且解析值落在 [1024, 我方发送值) 区间时
+    返回该上限，否则返回 None（不是超限错误或解析不可信，不触发收紧重试）。"""
     message = str(error)
-    if "max_tokens" not in message.lower() or sent_limit is None:
+    lowered = message.lower()
+    if sent_limit is None or not ("max_tokens" in lowered or "output token" in lowered):
         return None
-    match = (re.search(r">\s*(\d+)", message)
-             or re.search(r"maximum[^\d]*(\d+)", message, re.IGNORECASE))
-    if not match:
-        return None
-    cap = int(match.group(1))
-    if cap <= 0 or cap >= sent_limit:
-        return None
-    return cap
+    for pattern in _OUTPUT_CAP_PATTERNS:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if not match:
+            continue
+        cap = int(match.group(1))
+        if 1024 <= cap < sent_limit:
+            return cap
+        break  # 命中但数值不可信（过小/不小于发送值），不再尝试后续措辞
+    return None
+
+
+def _prompt_too_long(error) -> bool:
+    """判断错误是否为 prompt/上下文超长（此时可减半上下文窗口重试）"""
+    message = str(error).lower()
+    return any(kw in message for kw in ("prompt too long", "prompt is too long",
+                                        "context length", "maximum context",
+                                        "input length and", "reduce the length"))
 
 
 def estimate_message_chars(msg: dict) -> int:
@@ -127,8 +163,10 @@ def _is_tool_result_message(msg: dict) -> bool:
             and all(b.get("type") == "tool_result" for b in content))
 
 
-def window_messages(messages: list) -> list:
+def window_messages(messages: list, char_limit=None) -> list:
     """请求级历史窗口：总估算超预算时丢弃最旧的完整轮次，只在安全边界切分。
+
+    char_limit 为空时使用模块默认预算 CONTEXT_CHAR_LIMIT（1M 档）。
 
     规则：
     - 首条任务 user 消息永远保留（任务锚点）；
@@ -140,7 +178,7 @@ def window_messages(messages: list) -> list:
     只影响请求，不改动本地历史存档。
     """
     total = sum(estimate_message_chars(m) for m in messages)
-    if total <= CONTEXT_CHAR_LIMIT:
+    if total <= (char_limit or CONTEXT_CHAR_LIMIT):
         return messages
 
     n = len(messages)
@@ -157,7 +195,7 @@ def window_messages(messages: list) -> list:
             s = starts[pos]
             e = starts[pos + 1] if pos + 1 < len(starts) else n
             chars = sum(estimate_message_chars(m) for m in messages[s:e])
-            if kept_chars + chars > CONTEXT_CHAR_LIMIT and recent:
+            if kept_chars + chars > (char_limit or CONTEXT_CHAR_LIMIT) and recent:
                 break
             recent.append((s, e))
             kept_chars += chars
@@ -171,7 +209,7 @@ def window_messages(messages: list) -> list:
     # 至少保留任务锚点（首条 user）与最后的回答
     anchor_kept = bool(starts) and starts[0] == 0
     i = 1 if anchor_kept else 0
-    while i < n and total > CONTEXT_CHAR_LIMIT:
+    while i < n and total > (char_limit or CONTEXT_CHAR_LIMIT):
         if (messages[i].get("role") == "assistant"
                 and isinstance(messages[i].get("content"), list)
                 and any(b.get("type") == "tool_use" for b in messages[i]["content"])
@@ -197,12 +235,12 @@ class ApiError(Exception):
 
 
 def make_client(fmt: str, api_key: str, base_url: str, model: str,
-                thinking_effort: str = THINKING_OFF):
+                thinking_effort: str = THINKING_OFF, context_chars=None):
     """按格式创建对应客户端"""
     if fmt == ANTHROPIC:
-        return AnthropicClient(api_key, base_url, model, thinking_effort)
+        return AnthropicClient(api_key, base_url, model, thinking_effort, context_chars)
     if fmt == RESPONSES:
-        return ResponsesClient(api_key, base_url, model, thinking_effort)
+        return ResponsesClient(api_key, base_url, model, thinking_effort, context_chars)
     raise ApiError(f"未知的 API 格式: {fmt}")
 
 
@@ -412,11 +450,13 @@ def normalize_history_message(msg: dict) -> dict:
 
 class _BaseClient:
     def __init__(self, api_key: str, base_url: str, model: str,
-                 thinking_effort: str = THINKING_OFF):
+                 thinking_effort: str = THINKING_OFF, context_chars=None):
         self.api_key = (api_key or "").strip()
         self.base_url = (base_url or "").strip()
         self.model = (model or "").strip()
         self.thinking_effort = normalize_thinking_effort(thinking_effort)
+        # 请求级上下文预算（字符）；None 时用模块默认档（1M）
+        self.context_chars = context_chars
 
     def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None,
                on_thinking=None):
@@ -477,8 +517,10 @@ class _BaseClient:
                     continue
                 raise ApiError(f"网络错误: {e}") from e
 
-    # 服务端拒绝思考参数的错误特征（模型不支持思考 / max_tokens 超出输出上限）
-    _THINKING_ERROR_KEYWORDS = ("thinking", "reasoning", "budget", "max_tokens", "effort")
+    # 服务端拒绝思考参数的错误特征。注意不含 "max_tokens"：
+    # 输出上限类错误由 _parse_output_cap 专门处理（含数值解析与缓存），
+    # 思考类错误必须是明确的思考措辞，避免把 max_tokens 报错误当思考问题
+    _THINKING_ERROR_KEYWORDS = ("thinking", "reasoning", "budget", "effort")
 
     def _thinking_rejected(self, error: ApiError) -> bool:
         """判断错误是否因思考参数被拒（此时可去掉参数降级重试一次）"""
@@ -488,23 +530,32 @@ class _BaseClient:
         return any(kw in message for kw in self._THINKING_ERROR_KEYWORDS)
 
     def _open_with_degrade(self, url, build_payload, headers, is_cancelled=None):
-        """建立流连接；服务端拒绝思考参数或输出超限时自动修正后重试。
+        """建立流连接；服务端拒绝思考参数 / 输出超限 / prompt 超长时自动修正后重试。
 
-        最多修正两次，且可串联：max_tokens 超限 → 按服务端上报的上限收紧；
-        思考参数被拒 → 去掉思考参数。例如"先收紧上限、再去掉思考参数"。"""
+        修正可串联（最多 4 次尝试）：
+        - max_tokens 超限 → 按服务端上报的上限收紧（按 (base_url, model) 缓存，
+          后续请求直接带上，不再白挨 400）；
+        - 思考参数被拒 → 去掉思考参数；
+        - prompt 超长 → 上下文窗口减半。
+        修正次数耗尽时原样抛出最后一次的真实错误。"""
+        cache_key = (self.base_url, self.model)
         with_thinking = True
-        output_limit = None
-        for _ in range(3):
-            payload = build_payload(with_thinking, output_limit)
+        output_limit = _OUTPUT_CAPS.get(cache_key)
+        context_chars = None
+        last_error = None
+        for _ in range(4):
+            payload = build_payload(with_thinking, output_limit, context_chars)
             try:
                 return self._open_stream(url, payload, headers, is_cancelled)
             except ApiError as e:
+                last_error = e
                 cap = _parse_output_cap(e, payload.get("max_tokens"))
                 if cap is not None:
                     if cap == output_limit:
                         raise  # 已按该上限重试过仍报超限
                     print(f"max_tokens 超出模型输出上限，按 {cap} 收紧重试: {e}")
                     output_limit = cap
+                    _OUTPUT_CAPS[cache_key] = cap
                     continue
                 if self._thinking_rejected(e):
                     if not with_thinking:
@@ -512,8 +563,19 @@ class _BaseClient:
                     print(f"思考参数被服务端拒绝，已自动降级重试: {e}")
                     with_thinking = False
                     continue
+                if _prompt_too_long(e):
+                    base_chars = context_chars or self.context_chars or CONTEXT_CHAR_LIMIT
+                    halved = base_chars // 2
+                    # 大预算减到下限为止；小预算（特殊端点/测试）不受下限约束
+                    if base_chars > _MIN_CONTEXT_CHARS and halved < _MIN_CONTEXT_CHARS:
+                        raise  # 已到窗口下限
+                    if halved >= base_chars:
+                        raise
+                    print(f"prompt 超长，上下文窗口减半至 {halved} 字符重试: {e}")
+                    context_chars = halved
+                    continue
                 raise
-        raise ApiError("请求参数自动修正重试次数耗尽")
+        raise last_error  # 原样透传最后一次的真实错误，不用笼统消息覆盖
 
     @staticmethod
     def _emit_text(on_text, delta, is_cancelled):
@@ -544,7 +606,7 @@ class AnthropicClient(_BaseClient):
         return msg
 
     def _build_payload(self, messages, system, tools, with_thinking,
-                       output_limit=None):
+                       output_limit=None, context_chars=None):
         max_tokens = MAX_TOKENS
         thinking_on = with_thinking and self.thinking_effort != THINKING_OFF
         if thinking_on:
@@ -558,7 +620,8 @@ class AnthropicClient(_BaseClient):
                     ANTHROPIC_BUDGETS[self.thinking_effort] + THINKING_HEADROOM):
                 thinking_on = False
         # 上下文窗口裁剪对两个分支都生效（此前 else 分支用全量覆盖导致默认档失效）
-        windowed = [dict(m) for m in window_messages(messages)]
+        budget = context_chars if context_chars is not None else self.context_chars
+        windowed = [dict(m) for m in window_messages(messages, budget)]
         payload = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -586,8 +649,9 @@ class AnthropicClient(_BaseClient):
             auth = {"x-api-key": self.api_key}
         resp = self._open_with_degrade(
             self.endpoint(),
-            lambda with_thinking, output_limit=None: self._build_payload(
-                messages, system, tools, with_thinking, output_limit),
+            lambda with_thinking, output_limit=None, context_chars=None:
+                self._build_payload(messages, system, tools, with_thinking,
+                                    output_limit, context_chars),
             {**auth, "anthropic-version": "2023-06-01"},
             is_cancelled,
         )
@@ -682,11 +746,12 @@ class ResponsesClient(_BaseClient):
         return join_url(self.base_url, "/responses")
 
     def _build_payload(self, messages, system, tools, with_thinking,
-                       output_limit=None):
+                       output_limit=None, context_chars=None):
         # output_limit 仅用于 Anthropic 侧的输出上限收紧；Responses 不发送
         # 输出上限参数（由服务端取模型默认值），此参数仅为签名兼容而保留
+        budget = context_chars if context_chars is not None else self.context_chars
         items = []
-        for msg in window_messages(messages):
+        for msg in window_messages(messages, budget):
             items.extend(message_to_responses_items(msg))
         payload = {
             "model": self.model,
@@ -705,8 +770,9 @@ class ResponsesClient(_BaseClient):
                on_thinking=None):
         resp = self._open_with_degrade(
             self.endpoint(),
-            lambda with_thinking, output_limit=None: self._build_payload(
-                messages, system, tools, with_thinking, output_limit),
+            lambda with_thinking, output_limit=None, context_chars=None:
+                self._build_payload(messages, system, tools, with_thinking,
+                                    output_limit, context_chars),
             {"Authorization": f"Bearer {self.api_key}"},
             is_cancelled,
         )

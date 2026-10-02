@@ -81,7 +81,8 @@ class PuppyWidget(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(33)  # ~30fps
+        # 不在 __init__ 启动：桌宠初始不可见，由 showEvent 按需启动，
+        # 避免主窗口常开时每 33ms 空转唤醒一次
 
     # ---------- 对外接口 ----------
 

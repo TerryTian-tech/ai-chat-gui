@@ -88,6 +88,12 @@ QT_QPA_PLATFORM=offscreen python tests/offline_test.py
 - **DeepSeek（Anthropic 兼容端点）**：格式选 Anthropic，Base URL `https://api.deepseek.com/anthropic`
 - **其他兼容服务**：按服务方文档填写；若 Base URL 已以 `/messages` 或 `/responses` 结尾则不会重复追加
 
+### 模型适配注意事项
+- **输出上限**：默认请求 384K 输出（`aichat/api.py` 的 `MAX_TOKENS`）。上限较小的模型会返回 400，客户端解析服务端上报的上限后自动收紧并按模型缓存，无需手动调整
+- **上下文档位**：设置中可按模型上下文选择 128K / 200K / 1M 档（对应请求携带的历史预算约 10 万 / 16 万 / 80 万字符）。档位选大了会撑爆小上下文模型（超长时客户端会自动减半窗口重试），选小了只是用不满长上下文
+- **工具输出**：Agent 单个工具结果最大 5 万字符，超出截断（保留头尾）；`read` 大文件会占用可观的上下文预算
+- **思考强度**：档位映射 Anthropic `thinking.budget_tokens`（低 2048 / 中 8192 / 高 16384）；模型不支持思考时自动去掉该参数
+
 ## 🖥️ 使用指南
 
 ### 基本使用
