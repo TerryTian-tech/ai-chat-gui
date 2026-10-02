@@ -343,6 +343,23 @@ class ChatWindow(QMainWindow):
     HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".aichat")
     HISTORY_FILE = os.path.join(HISTORY_DIR, "conversations.json")
 
+    SEND_BUTTON_STYLE = """
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #667eea, stop:1 #764ba2);
+            color: white; border: none; border-radius: 30px; font-size: 16px; font-weight: 600;
+        }
+        QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5a6fd6, stop:1 #6a4190); }
+        QPushButton:disabled { background: #cbd5e0; }
+    """
+    STOP_BUTTON_STYLE = """
+        QPushButton {
+            background: #e53e3e; color: white; border: none;
+            border-radius: 30px; font-size: 15px; font-weight: 600;
+        }
+        QPushButton:hover { background: #c53030; }
+        QPushButton:pressed { background: #9b2c2c; }
+    """
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"AI 聊天机器人 {APP_VERSION}")
@@ -358,6 +375,11 @@ class ChatWindow(QMainWindow):
         self.current_ai_widget: MessageWidget = None
         self._request_conversation_id = None
         self._loading_assistant_widget: MessageWidget = None
+        self._request_active = False
+        self._confirm_box: QMessageBox = None
+        # 已取消但线程尚未结束的 worker：QThread 运行中销毁会 qFatal 直接退出进程，
+        # 必须暂存引用，等 finished 后再释放
+        self._retiring_workers: List[AgentWorker] = []
 
         settings = QSettings("MyChatApp", "Settings")
         self.api_format = settings.value("api_format", ANTHROPIC)
@@ -596,15 +618,8 @@ class ChatWindow(QMainWindow):
         self.send_btn = QPushButton("发送")
         self.send_btn.setCursor(Qt.PointingHandCursor)
         self.send_btn.setFixedSize(90, 48)
-        self.send_btn.clicked.connect(self.send_message)
-        self.send_btn.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #667eea, stop:1 #764ba2);
-                color: white; border: none; border-radius: 30px; font-size: 16px; font-weight: 600;
-            }
-            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #5a6fd6, stop:1 #6a4190); }
-            QPushButton:disabled { background: #cbd5e0; }
-        """)
+        self.send_btn.clicked.connect(self.on_send_clicked)
+        self.send_btn.setStyleSheet(self.SEND_BUTTON_STYLE)
         input_frame_layout.addWidget(self.send_btn, 0, Qt.AlignBottom)
 
         input_layout.addWidget(input_frame)
@@ -621,6 +636,32 @@ class ChatWindow(QMainWindow):
     def toggle_agent_mode(self, checked: bool):
         self.agent_mode = checked
         self.settings.setValue("agent_mode", checked)
+
+    def on_send_clicked(self):
+        """发送按钮双态：空闲时发送，请求进行中变为停止"""
+        if self._request_active:
+            self._stop_generation()
+        else:
+            self.send_message()
+
+    def _set_requesting_state(self, active: bool):
+        self._request_active = active
+        if active:
+            self.send_btn.setText("⏹ 停止")
+            self.send_btn.setToolTip("停止生成")
+            self.send_btn.setStyleSheet(self.STOP_BUTTON_STYLE)
+        else:
+            self.send_btn.setText("发送")
+            self.send_btn.setToolTip("")
+            self.send_btn.setStyleSheet(self.SEND_BUTTON_STYLE)
+        self.send_btn.setEnabled(True)
+
+    def _stop_generation(self):
+        """用户主动停止生成：取消 worker，封存已生成内容并回写已完成轮次"""
+        if self.api_worker and self.api_worker.isRunning():
+            self.api_worker.stop()  # 可能正卡在工具确认等待，先按拒绝唤醒
+        self._cancel_current_request()
+        self.save_conversations()
 
     # ---------- 设置与校验 ----------
 
@@ -807,21 +848,39 @@ class ChatWindow(QMainWindow):
         return datetime.min
 
     def _cancel_current_request(self):
-        """取消进行中的请求（切换/删除会话时调用）"""
-        if self.api_worker and self.api_worker.isRunning():
-            self.api_worker.stop()
-            try:
-                self.api_worker.stream_chunk.disconnect()
-                self.api_worker.thinking_chunk.disconnect()
-                self.api_worker.tool_call_started.disconnect()
-                self.api_worker.tool_call_finished.disconnect()
-                self.api_worker.confirm_requested.disconnect()
-                self.api_worker.history_ready.disconnect()
-                self.api_worker.turn_finished.disconnect()
-                self.api_worker.error_occurred.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+        """取消进行中的请求（停止按钮 / 切换或删除会话时调用）"""
+        if self.api_worker is not None:
+            worker = self.api_worker
             self.api_worker = None
+            if worker.isRunning():
+                worker.stop()
+                try:
+                    worker.stream_chunk.disconnect()
+                    worker.thinking_chunk.disconnect()
+                    worker.tool_call_started.disconnect()
+                    worker.tool_call_finished.disconnect()
+                    worker.confirm_requested.disconnect()
+                    worker.history_ready.disconnect()
+                    worker.turn_finished.disconnect()
+                    worker.error_occurred.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                # stop() 只是异步置位，线程此刻往往仍阻塞在流读取/退避等待中；
+                # 直接丢引用会销毁运行中的 QThread（qFatal 杀进程）。
+                # 暂存到回收列表，等 finished 后再释放。
+                self._retiring_workers.append(worker)
+                worker.finished.connect(worker.deleteLater)
+                worker.finished.connect(
+                    lambda w=worker: self._retiring_workers.remove(w)
+                    if w in self._retiring_workers else None)
+
+        # 模态确认框还开着的话关掉（用户已放弃请求，视为拒绝）
+        if self._confirm_box is not None:
+            try:
+                self._confirm_box.reject()
+            except RuntimeError:
+                pass
+            self._confirm_box = None
 
         if self.current_ai_widget:
             try:
@@ -835,7 +894,7 @@ class ChatWindow(QMainWindow):
 
         self.status_label.setText("● 就绪")
         self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
-        self.send_btn.setEnabled(True)
+        self._set_requesting_state(False)
 
     def create_new_conversation(self):
         self._cancel_current_request()
@@ -927,7 +986,7 @@ class ChatWindow(QMainWindow):
         model_lower = (self.model or '').lower()
         vision_keywords = [
             'vision', 'vl', 'visual', 'multimodal', 'mm',
-            '4o', 'gpt-4-turbo', 'gpt-4-vision',
+            '4o', 'gpt-4-turbo', 'gpt-4-vision', 'gpt-5',
             'claude-3', 'claude-3.5', 'claude-sonnet', 'claude-opus', 'claude-haiku',
             'gemini', 'qwen-vl', 'glm-4v', 'deepseek-vl',
             'llava', 'cogvlm', 'internvl', 'yi-vl'
@@ -1022,7 +1081,7 @@ class ChatWindow(QMainWindow):
         status_text = "● Agent 工作中..." if self.agent_mode else "● AI 正在思考..."
         self.status_label.setText(status_text)
         self.status_label.setStyleSheet("color: #ed8936; font-size: 14px; font-weight: 500;")
-        self.send_btn.setEnabled(False)
+        self._set_requesting_state(True)
         self.puppy_widget.set_ai_state("thinking")
 
         self.current_ai_widget = self.add_message_widget("assistant", "")
@@ -1103,12 +1162,17 @@ class ChatWindow(QMainWindow):
     def on_confirm_requested(self, name: str, args_display: str, approver):
         """GUI 线程弹窗确认危险工具（工作线程阻塞等待）"""
         preview = args_display if len(args_display) <= 800 else args_display[:800] + "…"
-        reply = QMessageBox.question(
-            self, "确认执行工具",
+        box = QMessageBox(
+            QMessageBox.Icon.Question, "确认执行工具",
             f"Agent 请求执行工具「{name}」：\n\n{preview}\n\n是否允许执行？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            self,
         )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        self._confirm_box = box
+        reply = box.exec()
+        if self._confirm_box is box:
+            self._confirm_box = None
         approver.decide(reply == QMessageBox.StandardButton.Yes)
 
     def on_history_ready(self, messages):
@@ -1134,7 +1198,7 @@ class ChatWindow(QMainWindow):
 
         self.status_label.setText("● 就绪")
         self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
-        self.send_btn.setEnabled(True)
+        self._set_requesting_state(False)
         self.save_conversations()
 
     def on_api_error(self, error_msg: str):
@@ -1152,10 +1216,12 @@ class ChatWindow(QMainWindow):
         QMessageBox.critical(self, "API错误", f"请求失败：{error_msg}")
         self.status_label.setText("● 错误")
         self.status_label.setStyleSheet("color: #f56565; font-size: 14px; font-weight: 500;")
-        self.send_btn.setEnabled(True)
+        self._set_requesting_state(False)
         self.puppy_widget.set_ai_state("sad")
 
-        if self.current_ai_widget and not self.current_ai_widget.get_all_text():
+        # 仅在气泡完全无内容（正文/工具卡片/思考卡）时移除；
+        # 已显示的工具调用卡片要保留——历史已回写，重新加载能看到
+        if self.current_ai_widget and self.current_ai_widget.is_empty():
             try:
                 index = self.messages_layout.indexOf(self.current_ai_widget)
                 if index >= 0:
@@ -1166,6 +1232,7 @@ class ChatWindow(QMainWindow):
 
         self.current_ai_widget = None
         self._request_conversation_id = None
+        self.save_conversations()
 
     # ---------- 历史持久化 ----------
 
@@ -1209,9 +1276,8 @@ class ChatWindow(QMainWindow):
             temp_file = self.HISTORY_FILE + ".tmp"
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            if os.path.exists(self.HISTORY_FILE):
-                os.remove(self.HISTORY_FILE)
-            os.rename(temp_file, self.HISTORY_FILE)
+            # os.replace 为原子替换：不存在"删了旧档还没写入新档"的丢档窗口
+            os.replace(temp_file, self.HISTORY_FILE)
         except Exception as e:
             print(f"保存对话历史失败: {e}")
 
@@ -1327,6 +1393,13 @@ class ChatWindow(QMainWindow):
             self.api_worker.stop()
             if not self.api_worker.wait(3000):
                 self.api_worker.terminate()
+
+        # 已取消但尚未结束的 worker 同样要等完/终止，避免退出时销毁运行中的线程
+        for worker in list(self._retiring_workers):
+            worker.stop()
+            if not worker.wait(3000):
+                worker.terminate()
+        self._retiring_workers.clear()
 
         if hasattr(self, 'process_monitor') and self.process_monitor.isRunning():
             self.process_monitor.stop()

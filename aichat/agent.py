@@ -88,18 +88,21 @@ def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return f"{head}\n... (已截断，共 {len(text)} 字符) ...\n{tail}"
 
 
-def _read_text_file(path: str) -> str:
-    """多编码尝试读取文本文件"""
+def _read_text_file(path: str):
+    """多编码尝试读取文本文件，返回 (文本, 实际命中编码)；OSError 时返回 (错误消息, None)。
+
+    newline='' 保留原始换行符；编码随文本一并返回：edit 写回时必须沿用，
+    否则会把 GBK 等文件静默转成 UTF-8、把 LF/CRLF 统一成本机换行符。"""
     for enc in ("utf-8", "gbk", "gb18030", "big5", "latin-1"):
         try:
-            with open(path, "r", encoding=enc) as f:
-                return f.read()
+            with open(path, "r", encoding=enc, newline="") as f:
+                return f.read(), enc
         except UnicodeDecodeError:
             continue
         except OSError as e:
-            return f"error: {e}"
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+            return f"error: {e}", None
+    with open(path, "r", encoding="utf-8", newline="", errors="ignore") as f:
+        return f.read(), "utf-8"
 
 
 def tool_read(args, workdir):
@@ -107,7 +110,8 @@ def tool_read(args, workdir):
     path = _resolve(workdir, args["path"])
     if not os.path.isfile(path):
         return f"error: file not found: {path}"
-    lines = _read_text_file(path).splitlines(keepends=True)
+    text, _enc = _read_text_file(path)
+    lines = text.splitlines(keepends=True)
     offset = max(int(args.get("offset", 0) or 0), 0)
     limit = args.get("limit")
     limit = int(limit) if limit is not None else len(lines)
@@ -118,28 +122,39 @@ def tool_read(args, workdir):
 
 
 def tool_write(args, workdir):
-    """整文件写入（覆盖）"""
+    """整文件写入（覆盖）；newline='' 使模型给出的换行符原样落盘"""
     path = _resolve(workdir, args["path"])
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(args["content"])
     return "ok"
 
 
 def tool_edit(args, workdir):
-    """基于字符串替换的编辑（old 需唯一，除非 all=true）"""
+    """基于字符串替换的编辑（old 需唯一，除非 all=true）；写回沿用文件原编码与换行符"""
     path = _resolve(workdir, args["path"])
-    text = _read_text_file(path)
+    text, enc = _read_text_file(path)
+    if enc is None:
+        return text  # "error: ..."（文件不可读）
+    # CRLF 文件先规范化为 LF 参与匹配（模型给的 old/new 通常用 LF），写回时还原
+    crlf = "\r\n" in text
+    if crlf:
+        text = text.replace("\r\n", "\n")
     old, new = args["old"], args["new"]
+    if crlf:
+        old = old.replace("\r\n", "\n")
+        new = new.replace("\r\n", "\n")
     if old not in text:
         return "error: old_string not found"
     count = text.count(old)
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times, must be unique (use all=true)"
     replacement = text.replace(old, new) if args.get("all") else text.replace(old, new, 1)
-    with open(path, "w", encoding="utf-8") as f:
+    if crlf:
+        replacement = replacement.replace("\n", "\r\n")
+    with open(path, "w", encoding=enc, newline="") as f:
         f.write(replacement)
     return "ok"
 
@@ -152,12 +167,13 @@ def tool_glob(args, workdir):
     base = args.get("path") or "."
     pattern = _resolve(workdir, os.path.join(base, args["pat"]))
     files = [f for f in globlib.glob(pattern, recursive=True) if os.path.isfile(f)]
-    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    # 排序期间文件可能被删除，取不到 mtime 的排最前
+    files.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0, reverse=True)
     return "\n".join(files[:200]) or "none"
 
 
 def tool_grep(args, workdir):
-    """跨文件正则搜索（最多返回 50 条命中）"""
+    """跨文件正则搜索（最多返回 50 条命中；多编码探测，与 read 策略一致）"""
     try:
         pattern = re.compile(args["pat"])
     except re.error as e:
@@ -171,14 +187,16 @@ def tool_grep(args, workdir):
             try:
                 if os.path.getsize(fpath) > 2_000_000:
                     continue
-                with open(fpath, "r", encoding="utf-8") as f:
-                    for num, line in enumerate(f, 1):
-                        if pattern.search(line):
-                            hits.append(f"{fpath}:{num}:{line.rstrip()}")
-                            if len(hits) >= 50:
-                                return "\n".join(hits)
-            except (OSError, UnicodeDecodeError):
+            except OSError:
                 continue
+            text, enc = _read_text_file(fpath)
+            if enc is None or "\x00" in text:  # 不可读或疑似二进制文件
+                continue
+            for num, line in enumerate(text.splitlines(), 1):
+                if pattern.search(line):
+                    hits.append(f"{fpath}:{num}:{line.rstrip()}")
+                    if len(hits) >= 50:
+                        return "\n".join(hits)
     return "\n".join(hits) or "none"
 
 
@@ -318,16 +336,38 @@ class AgentWorker(QThread):
         self.thinking_effort = thinking_effort
         self.system_prompt = system_prompt
         self._running = True
+        self._pending_approver = None  # 正在等待用户确认的工具批准器
 
     def stop(self):
         self._running = False
+        # 若工作线程正卡在工具确认等待，主动按拒绝唤醒，避免悬挂到 300s 超时
+        approver = self._pending_approver
+        if approver is not None:
+            approver.decide(False)
 
     def run(self):
         try:
             self._run_loop()
         except Exception as e:
             if self._running:
+                # 中途失败也要把已完成轮次回写历史：界面上已显示的工具调用
+                # 不至于在重新加载会话后凭空消失
+                self.history_ready.emit(self._completed_history())
                 self.error_occurred.emit(str(e))
+
+    def _completed_history(self):
+        """失败时的安全历史：尾部 assistant 的 tool_use 若无 tool_result 跟随
+        （失败发生在工具结果回传前），剥离工具块，避免下次请求被 API 拒绝"""
+        msgs = self.messages
+        if msgs and msgs[-1].get("role") == "assistant":
+            content = msgs[-1].get("content")
+            if isinstance(content, list) and any(
+                    b.get("type") == "tool_use" for b in content):
+                kept = [b for b in content if b.get("type") != "tool_use"]
+                if kept:
+                    return msgs[:-1] + [{"role": "assistant", "content": kept}]
+                return msgs[:-1]
+        return msgs
 
     def _run_loop(self):
         client = make_client(self.fmt, self.api_key, self.base_url, self.model,
@@ -374,8 +414,12 @@ class AgentWorker(QThread):
 
                 if self.confirm_tools and tu["name"] in CONFIRM_TOOLS:
                     approver = ToolApprover()
+                    # 先登记再发信号：stop() 在信号被 GUI 处理前后都能唤醒
+                    self._pending_approver = approver
                     self.confirm_requested.emit(tu["name"], args_json, approver)
-                    if not approver.wait():
+                    approved = approver.wait()
+                    self._pending_approver = None
+                    if not approved:
                         output = "error: user declined this tool call"
                         self.tool_call_finished.emit(tu["id"], output, False)
                         results.append(
@@ -391,6 +435,8 @@ class AgentWorker(QThread):
                 )
 
             self.messages.append({"role": "user", "content": results})
+            # 每完成一轮工具回传就回写一次历史（快照）：中途失败/取消时已完成轮次不丢失
+            self.history_ready.emit(list(self.messages))
 
         if not self._running:
             return

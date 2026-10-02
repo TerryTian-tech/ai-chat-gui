@@ -1058,6 +1058,13 @@ class MessageWidget(QFrame):
     def get_all_text(self) -> str:
         return self._plain_text()
 
+    def is_empty(self) -> bool:
+        """气泡是否完全无内容（正文 / 工具卡片 / 思考卡）；
+        出错时据此决定是否移除气泡，有工具卡片的要保留"""
+        return (not self._plain_text().strip()
+                and not self._tool_widgets
+                and not self._thinking_widgets)
+
     def copy_all_content(self):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.get_all_text())

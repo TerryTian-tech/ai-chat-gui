@@ -18,6 +18,7 @@
 """
 
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -51,6 +52,113 @@ ANTHROPIC_BUDGETS = {
 # 思考 token 计入 max_tokens，官方要求 max_tokens > budget_tokens，
 # 预留 4096 给可见正文
 THINKING_HEADROOM = 4096
+
+# 连接阶段可重试的 HTTP 状态码与重试次数（指数退避 1s/2s）
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_MAX_OPEN_ATTEMPTS = 3
+
+# 请求携带的历史字符预算（粗略估算，超出的旧轮次不随请求发送）。
+# 只裁剪请求，不动本地历史存档；按完整轮次边界裁剪，保证 tool_use/tool_result 配对完整
+CONTEXT_CHAR_LIMIT = 120_000
+
+
+def _retry_delay(http_error, default_delay: float) -> float:
+    """重试等待秒数：优先用服务端的 Retry-After，夹在 [1, 30] 区间"""
+    try:
+        wait = float(http_error.headers.get("Retry-After") or default_delay)
+    except (TypeError, ValueError):
+        wait = default_delay
+    return min(max(wait, 1.0), 30.0)
+
+
+def estimate_message_chars(msg: dict) -> int:
+    """粗略估算一条消息占用的上下文字符数（图片按固定开销计，base64 不计入）"""
+    content = msg.get("content")
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    total = 0
+    for block in content:
+        btype = block.get("type")
+        if btype == "text":
+            total += len(block.get("text", ""))
+        elif btype == "thinking":
+            total += len(block.get("thinking", ""))
+        elif btype == "image":
+            total += 2000  # 图片按约 2k token 的固定开销估算
+        elif btype == "tool_use":
+            total += len(json.dumps(block.get("input") or {}, ensure_ascii=False))
+        elif btype == "tool_result":
+            total += len(str(block.get("content", "")))
+    return total
+
+
+def _is_tool_result_message(msg: dict) -> bool:
+    """user 消息是否仅由 tool_result 组成（agent 工具回传，不是新轮次的开始）"""
+    content = msg.get("content")
+    return (msg.get("role") == "user" and isinstance(content, list) and bool(content)
+            and all(b.get("type") == "tool_result" for b in content))
+
+
+def window_messages(messages: list) -> list:
+    """请求级历史窗口：总估算超预算时丢弃最旧的完整轮次，只在安全边界切分。
+
+    规则：
+    - 首条任务 user 消息永远保留（任务锚点）；
+    - 多任务轮：从旧到新丢弃完整任务轮（user 任务消息及其全部后续消息），
+      但最新一轮始终保留；
+    - 单任务长 agent 历史：从旧到新丢弃完整工具交换对
+      （assistant(tool_use) + 紧随的 tool_result user）；
+    - tool_use/tool_result 配对永不被拆散，裁剪结果始终是合法的请求历史。
+    只影响请求，不改动本地历史存档。
+    """
+    total = sum(estimate_message_chars(m) for m in messages)
+    if total <= CONTEXT_CHAR_LIMIT:
+        return messages
+
+    n = len(messages)
+    starts = [i for i, m in enumerate(messages)
+              if m.get("role") == "user" and not _is_tool_result_message(m)]
+
+    if len(starts) >= 2:
+        # 多任务轮：第一轮完整保留 + 从新到旧收集轮次直到预算用尽
+        first_end = starts[1]
+        kept = list(range(first_end))
+        kept_chars = sum(estimate_message_chars(m) for m in messages[:first_end])
+        recent = []
+        for pos in range(len(starts) - 1, 0, -1):
+            s = starts[pos]
+            e = starts[pos + 1] if pos + 1 < len(starts) else n
+            chars = sum(estimate_message_chars(m) for m in messages[s:e])
+            if kept_chars + chars > CONTEXT_CHAR_LIMIT and recent:
+                break
+            recent.append((s, e))
+            kept_chars += chars
+        if not recent:
+            return messages
+        for s, e in reversed(recent):
+            kept.extend(range(s, e))
+        return [messages[i] for i in kept]
+
+    # 单任务长 agent 历史：从旧到新丢弃完整工具交换对，
+    # 至少保留任务锚点（首条 user）与最后的回答
+    anchor_kept = bool(starts) and starts[0] == 0
+    i = 1 if anchor_kept else 0
+    while i < n and total > CONTEXT_CHAR_LIMIT:
+        if (messages[i].get("role") == "assistant"
+                and isinstance(messages[i].get("content"), list)
+                and any(b.get("type") == "tool_use" for b in messages[i]["content"])
+                and i + 1 < n and _is_tool_result_message(messages[i + 1])
+                and i + 2 <= n - 1):  # 交换对之后还要留有回答
+            total -= sum(estimate_message_chars(m) for m in messages[i:i + 2])
+            i += 2
+        else:
+            break
+    if i == (1 if anchor_kept else 0):
+        return messages  # 无可安全丢弃的交换对
+    kept = ([messages[0]] if anchor_kept else []) + messages[i:]
+    return kept
 
 
 def normalize_thinking_effort(effort) -> str:
@@ -298,14 +406,32 @@ class _BaseClient:
             headers={"Content-Type": "application/json", **headers},
             method="POST",
         )
-        try:
-            return urllib.request.urlopen(req, timeout=STREAM_TIMEOUT)
-        except urllib.error.HTTPError as e:
-            raise ApiError(_http_error_message(e)) from e
-        except urllib.error.URLError as e:
-            raise ApiError(f"连接失败: {e.reason}") from e
-        except OSError as e:
-            raise ApiError(f"网络错误: {e}") from e
+        # 连接阶段（尚未收到任何流增量）对 429/5xx/网络闪断做指数退避重试，
+        # 此时重试不会产生重复输出；流中途失败无法安全续传，仍直接抛出
+        delay = 1.0
+        for attempt in range(_MAX_OPEN_ATTEMPTS):
+            try:
+                return urllib.request.urlopen(req, timeout=STREAM_TIMEOUT)
+            except urllib.error.HTTPError as e:
+                if e.code in _RETRYABLE_HTTP_CODES and attempt < _MAX_OPEN_ATTEMPTS - 1:
+                    wait = _retry_delay(e, delay)
+                    print(f"请求失败（HTTP {e.code}），{wait:.0f}s 后重试: {url}")
+                    time.sleep(wait)
+                    delay *= 2
+                    continue
+                raise ApiError(_http_error_message(e)) from e
+            except urllib.error.URLError as e:
+                if attempt < _MAX_OPEN_ATTEMPTS - 1:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise ApiError(f"连接失败: {e.reason}") from e
+            except OSError as e:
+                if attempt < _MAX_OPEN_ATTEMPTS - 1:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise ApiError(f"网络错误: {e}") from e
 
     # 服务端拒绝思考参数的错误特征（模型不支持思考 / max_tokens 超出输出上限）
     _THINKING_ERROR_KEYWORDS = ("thinking", "reasoning", "budget", "max_tokens", "effort")
@@ -361,7 +487,7 @@ class AnthropicClient(_BaseClient):
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "system": system or "",
-            "messages": [dict(m) for m in messages],
+            "messages": [dict(m) for m in window_messages(messages)],
             "stream": True,
         }
         if with_thinking and self.thinking_effort != THINKING_OFF:
@@ -479,7 +605,7 @@ class ResponsesClient(_BaseClient):
 
     def _build_payload(self, messages, system, tools, with_thinking: bool) -> dict:
         items = []
-        for msg in messages:
+        for msg in window_messages(messages):
             items.extend(message_to_responses_items(msg))
         payload = {
             "model": self.model,
@@ -504,6 +630,7 @@ class ResponsesClient(_BaseClient):
 
         final_output = None
         error_message = None
+        done_items = []  # 逐项到达的 output_item.done，作为无 response.completed 网关的兜底
         try:
             with resp:
                 for event, data in _iter_sse(resp):
@@ -519,6 +646,10 @@ class ResponsesClient(_BaseClient):
                     elif etype in ("response.reasoning_summary_text.delta",
                                    "response.reasoning_text.delta"):
                         self._emit_text(on_thinking, obj.get("delta", ""), is_cancelled)
+                    elif etype == "response.output_item.done":
+                        item = obj.get("item")
+                        if item is not None:
+                            done_items.append(item)
                     elif etype == "response.completed":
                         final_output = (obj.get("response") or {}).get("output")
                     elif etype in ("response.failed", "error"):
@@ -535,7 +666,10 @@ class ResponsesClient(_BaseClient):
         if final_output is None:
             if error_message:
                 raise ApiError(error_message)
-            raise ApiError("响应流提前结束（未收到 response.completed）")
+            if not done_items:
+                raise ApiError("响应流提前结束（未收到 response.completed）")
+            # 部分兼容网关只逐项发 output_item.done 就结束流
+            final_output = done_items
 
         blocks = responses_output_to_blocks(final_output)
         return {"blocks": blocks, "stop_reason": "end_turn"}

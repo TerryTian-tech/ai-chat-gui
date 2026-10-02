@@ -16,6 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# 中文 Windows 上输出重定向到管道时 stdout 可能是 GBK，✓/✗ 符号会炸编码
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 PASS = []
 FAIL = []
 
@@ -238,6 +242,72 @@ def start_server():
 
 # ==================== 测试用例 ====================
 
+def test_stop_generation():
+    print("\n[3.11] 停止生成（取消后 worker 不得在运行中被销毁）")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from aichat.window import ChatWindow
+
+    class SlowHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            time.sleep(1.0)  # 让 worker 停留在阻塞的请求中
+            sse = anth_events([("text", "慢慢回复")])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            data = sse.encode("utf-8")
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    hist_dir = tempfile.mkdtemp(prefix="aichat_hist2_")
+    ChatWindow.HISTORY_DIR = hist_dir
+    ChatWindow.HISTORY_FILE = os.path.join(hist_dir, "conversations.json")
+    win = ChatWindow()
+    try:
+        win.api_format, win.api_key = "anthropic", "sk-test"
+        win.base_url, win.model = f"http://127.0.0.1:{server.server_address[1]}", "m"
+        win.thinking_effort = "off"
+        win.input_edit.setPlainText("你好")
+        win.send_message()
+        check("停止: 请求进行中按钮变为停止态",
+              win._request_active and win.api_worker is not None
+              and win.send_btn.text() == "⏹ 停止", win.send_btn.text())
+        time.sleep(0.2)  # 此刻 worker 正阻塞在服务器的 1s 延迟上
+        win._stop_generation()
+        check("停止: 点击后恢复发送态",
+              win.api_worker is None and not win._request_active
+              and win.send_btn.text() == "发送", win.send_btn.text())
+        check("停止: worker 移入回收列表而非被直接销毁",
+              len(win._retiring_workers) == 1, str(len(win._retiring_workers)))
+        worker = win._retiring_workers[0]
+        ok = worker.wait(8000)
+        for _ in range(100):
+            app.processEvents()
+            if not win._retiring_workers:
+                break
+            time.sleep(0.05)
+        check("停止: worker 自然结束后回收、进程存活",
+              ok and not win._retiring_workers, f"wait={ok}")
+    finally:
+        win.process_monitor.stop()
+        win.process_monitor.wait(2000)
+        server.shutdown()
+        shutil.rmtree(hist_dir, ignore_errors=True)
+
+
 def test_api_clients(base):
     print("\n[1] API 客户端直连（双格式流式 + 工具调用组装）")
     from aichat.api import AnthropicClient, ResponsesClient, ApiError
@@ -360,13 +430,13 @@ class ErrHandler(BaseHTTPRequestHandler):
 
 
 class FailFirstHandler(BaseHTTPRequestHandler):
-    """前 fail_count 次请求返回 400（消息可配置），之后返回正常 SSE。
+    """前 fail_count 次请求返回 error_code（消息可配置），之后返回正常 SSE。
 
-    用于验证：思考参数被服务端拒绝（模型不支持思考 / max_tokens 超输出上限）时
-    客户端自动去掉参数降级重试一次。
+    用于验证：思考参数被拒时自动降级重试一次；429/5xx 连接阶段指数退避重试。
     """
     protocol_version = "HTTP/1.1"
     calls = []  # [(path, body)]
+    error_code = 400
     error_message = ("max_tokens: 20480 > 8192, which is the maximum allowed number "
                      "of output tokens; thinking is not supported by this model")
     fail_count = 1
@@ -380,7 +450,7 @@ class FailFirstHandler(BaseHTTPRequestHandler):
         type(self).calls.append((self.path, body))
         if len(type(self).calls) <= type(self).fail_count:
             payload = json.dumps({"error": {"message": type(self).error_message}}).encode()
-            self.send_response(400)
+            self.send_response(type(self).error_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -390,6 +460,49 @@ class FailFirstHandler(BaseHTTPRequestHandler):
             sse = anth_events([("text", "降级成功")])
         else:
             sse = resp_events([("text", "degraded ok")])
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        data = sse.encode("utf-8")
+        for i in range(0, len(data), 64):
+            piece = data[i:i + 64]
+            self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+        self.wfile.write(b"0\r\n\r\n")
+
+
+class FailNthHandler(BaseHTTPRequestHandler):
+    """序号在 fail_on 内的请求返回 500，其余返回正常 Anthropic SSE。
+
+    用于验证：agent 循环中途失败时，已完成轮次的历史仍会回写。
+    """
+    protocol_version = "HTTP/1.1"
+    calls = []
+    fail_on = {2, 3, 4, 5, 6, 7, 8}  # 默认第 2 个请求起持续失败（含退避重试）
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        type(self).calls.append((self.path, body))
+        if len(type(self).calls) in type(self).fail_on:
+            payload = json.dumps({"error": {"message": "server exploded"}}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if FakeAPIHandler._has_tool_result(body):
+            sse = anth_events([("text", "文件已写入")])
+        else:
+            sse = anth_events([
+                ("text", "我来创建文件。"),
+                ("tool_use", "toolu_01", "write",
+                 json.dumps({"path": "err_history.txt", "content": "hi"})),
+            ])
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
@@ -664,6 +777,236 @@ def test_thinking_degrade():
         server.shutdown()
 
 
+def test_error_history_writeback():
+    print("\n[3.6] 中途失败的历史回写（已完成轮次不丢失）")
+    from aichat.agent import AgentWorker
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FailNthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    workdir = tempfile.mkdtemp(prefix="aichat_t4_")
+    try:
+        FailNthHandler.calls.clear()
+        events = {"chunks": [], "history": None, "error": None, "done": False}
+        worker = AgentWorker(
+            messages=[{"role": "user", "content": "创建文件"}],
+            fmt="anthropic", api_key="sk", base_url=base, model="m",
+            agent_mode=True, workdir=workdir, confirm_tools=False)
+        worker.stream_chunk.connect(events["chunks"].append)
+        worker.history_ready.connect(lambda h: events.update(history=h))
+        worker.turn_finished.connect(lambda: events.update(done=True))
+        worker.error_occurred.connect(lambda e: events.update(error=e))
+        worker.run()
+        check("agent 中途 500: 报错且未正常结束",
+              events["error"] is not None and not events["done"], str(events["error"]))
+        check("agent 中途 500: 第一轮文本与工具事件已发生",
+              "".join(events["chunks"]) == "我来创建文件。", repr(events["chunks"]))
+        history = events["history"]
+        check("agent 中途 500: 已完成轮次回写历史",
+              history is not None and len(history) == 3
+              and history[1]["role"] == "assistant"
+              and any(b.get("type") == "tool_use" for b in history[1]["content"])
+              and history[2]["role"] == "user"
+              and history[2]["content"][0].get("type") == "tool_result",
+              str(history)[:300] if history else "None")
+
+        # 普通聊天首轮即失败（持续失败盖过连接级重试）：历史也回写（仅 user 消息）
+        FailNthHandler.calls.clear()
+        FailNthHandler.fail_on = {1, 2, 3}
+        events2 = {"history": None, "error": None}
+        worker2 = AgentWorker(
+            messages=[{"role": "user", "content": "hi"}],
+            fmt="anthropic", api_key="sk", base_url=base, model="m")
+        worker2.history_ready.connect(lambda h: events2.update(history=h))
+        worker2.error_occurred.connect(lambda e: events2.update(error=e))
+        worker2.run()
+        check("普通聊天失败: 历史仍回写",
+              events2["error"] is not None and events2["history"] is not None
+              and len(events2["history"]) == 1,
+              f"{events2['error']} / {events2['history']}")
+    finally:
+        FailNthHandler.fail_on = {2, 3, 4, 5, 6, 7, 8}
+        server.shutdown()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_retry_backoff():
+    print("\n[3.7] 连接阶段重试退避（429 → 指数退避后成功）")
+    from aichat.api import AnthropicClient, ApiError
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FailFirstHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_code = 429
+        FailFirstHandler.error_message = "rate limited"
+        FailFirstHandler.fail_count = 2
+        texts = []
+        AnthropicClient("k", base, "m").stream(
+            [{"role": "user", "content": "hi"}], "s", on_text=texts.append)
+        check("anthropic: 429 两次后第三次成功", len(FailFirstHandler.calls) == 3,
+              str(len(FailFirstHandler.calls)))
+        check("anthropic: 重试成功后正文正常", "".join(texts) == "降级成功", repr(texts))
+
+        # 400 不属于可重试状态码：连接阶段只发一次（降级逻辑另行处理）
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_code = 400
+        FailFirstHandler.error_message = "bad request"
+        FailFirstHandler.fail_count = 3
+        try:
+            AnthropicClient("k", base, "m").stream([{"role": "user", "content": "hi"}], "s")
+            check("anthropic: 400 不做连接级重试", False)
+        except ApiError as e:
+            check("anthropic: 400 不做连接级重试",
+                  len(FailFirstHandler.calls) == 1 and "bad request" in str(e),
+                  f"{len(FailFirstHandler.calls)} / {e}")
+    finally:
+        FailFirstHandler.error_code = 400
+        FailFirstHandler.error_message = ("max_tokens: 20480 > 8192, which is the maximum "
+                                          "allowed number of output tokens; thinking is not "
+                                          "supported by this model")
+        FailFirstHandler.fail_count = 1
+        server.shutdown()
+
+
+def test_context_window():
+    print("\n[3.8] 请求级上下文窗口（超预算裁旧轮次，配对完整）")
+    import aichat.api as api_mod
+    from aichat.api import estimate_message_chars, window_messages
+
+    small = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    check("窗口: 预算内历史原样返回", window_messages(small) == small)
+
+    orig_limit = api_mod.CONTEXT_CHAR_LIMIT
+    try:
+        api_mod.CONTEXT_CHAR_LIMIT = 6000
+        # 多任务轮：裁中间、留首尾
+        msgs = []
+        for i in range(4):
+            msgs.append({"role": "user", "content": f"问题{i}" + "字" * 4000})
+            msgs.append({"role": "assistant", "content": f"回答{i}" + "字" * 4000})
+        windowed = window_messages(msgs)
+        check("窗口: 首轮与最新轮保留、中间轮被裁",
+              len(windowed) == 4
+              and windowed[0]["content"].startswith("问题0")
+              and windowed[1]["content"].startswith("回答0")
+              and windowed[2]["content"].startswith("问题3")
+              and windowed[3]["content"].startswith("回答3"),
+              str([m["content"][:6] for m in windowed]))
+        est = sum(estimate_message_chars(m) for m in windowed)
+        check("窗口: 裁剪后估算量下降", est < sum(estimate_message_chars(m) for m in msgs))
+
+        # 单任务长 agent 历史：按工具交换对从头裁，配对不被拆散
+        agent_msgs = [{"role": "user", "content": "task"}]
+        for i in range(5):
+            agent_msgs.append({"role": "assistant", "content": [
+                {"type": "tool_use", "id": f"t{i}", "name": "bash",
+                 "input": {"cmd": "x" * 2500}}]})
+            agent_msgs.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": "y" * 2500}]})
+        agent_msgs.append({"role": "assistant", "content": "完成"})
+        w2 = window_messages(agent_msgs)
+        pairing_ok = True
+        for idx, m in enumerate(w2):
+            if m["role"] == "assistant" and isinstance(m["content"], list):
+                for b in m["content"]:
+                    if b.get("type") != "tool_use":
+                        continue
+                    nxt = w2[idx + 1] if idx + 1 < len(w2) else None
+                    if not (isinstance(nxt, dict) and nxt.get("role") == "user"
+                            and isinstance(nxt.get("content"), list)
+                            and any(r.get("type") == "tool_result"
+                                    and r.get("tool_use_id") == b["id"]
+                                    for r in nxt["content"])):
+                        pairing_ok = False
+        check("窗口: agent 历史裁剪后 tool_use/tool_result 仍配对", pairing_ok)
+        check("窗口: agent 历史保留任务锚点与最终回答",
+              w2[0]["content"] == "task" and w2[-1]["content"] == "完成",
+              str([m["role"] for m in w2]))
+        est2 = sum(estimate_message_chars(m) for m in w2)
+        check("窗口: agent 历史裁剪后估算量受限",
+              est2 <= api_mod.CONTEXT_CHAR_LIMIT + 10, str(est2))
+    finally:
+        api_mod.CONTEXT_CHAR_LIMIT = orig_limit
+
+
+def test_encoding_tools(workdir):
+    print("\n[3.9] 编码保持（edit 不再静默转码；grep 多编码可搜）")
+    from aichat import agent as A
+
+    gbk_path = os.path.join(workdir, "gbk.txt")
+    gbk_content = "第一行中文\nline2\n第三行\n"
+    with open(gbk_path, "wb") as f:
+        f.write(gbk_content.encode("gbk"))
+
+    check("edit: GBK 文件编辑成功", A.run_tool(
+        "edit", {"path": "gbk.txt", "old": "line2", "new": "LINE2"}, workdir) == "ok")
+    with open(gbk_path, "rb") as f:
+        raw = f.read()
+    check("edit: GBK 编码保持不变（未被转成 UTF-8）",
+          raw.decode("gbk") == "第一行中文\nLINE2\n第三行\n"
+          and raw != gbk_content.replace("line2", "LINE2").encode("utf-8"), repr(raw[:30]))
+
+    check("grep: GBK 中文文件可搜", "gbk.txt" in A.run_tool("grep", {"pat": "第三行"}, workdir))
+    with open(os.path.join(workdir, "bin.dat"), "wb") as f:
+        f.write(bytes([0, 1, 2, 0, 3]) * 100)
+    check("grep: 二进制文件被跳过不误报", A.run_tool("grep", {"pat": "\x00\x01"}, workdir) == "none"
+          or "bin.dat" not in A.run_tool("grep", {"pat": "\x00\x01"}, workdir))
+
+    check("read: GBK 文件读取带行号", "第一行中文" in A.run_tool("read", {"path": "gbk.txt"}, workdir))
+
+
+def test_responses_done_fallback():
+    print("\n[3.10] Responses 网关兜底（只发 output_item.done 也能出块）")
+    import urllib.request
+    from aichat.api import ResponsesClient
+
+    text = "网关兜底文本"
+    done_item = {"type": "message", "id": "msg_0", "role": "assistant",
+                 "content": [{"type": "output_text", "text": text}]}
+    events = [
+        "event: response.created",
+        'data: {"type":"response.created","response":{"id":"resp_t"}}',
+        "",
+        "event: response.output_item.added",
+        "data: " + json.dumps({"type": "response.output_item.added", "output_index": 0,
+                               "item": {"type": "message", "id": "msg_0", "role": "assistant",
+                                        "content": []}}),
+        "",
+        "event: response.output_text.delta",
+        "data: " + json.dumps({"type": "response.output_text.delta", "output_index": 0,
+                               "delta": text}),
+        "",
+        "event: response.output_item.done",
+        "data: " + json.dumps({"type": "response.output_item.done", "output_index": 0,
+                               "item": done_item}),
+        "",
+    ]
+
+    class FakeResp:
+        def __init__(self, lines):
+            self._lines = [l.encode() for l in lines]
+        def __iter__(self):
+            return iter(self._lines)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    texts = []
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=None: FakeResp(events)
+    try:
+        result = ResponsesClient("k", "http://x", "m").stream(
+            [{"role": "user", "content": "hi"}], "s", on_text=texts.append)
+    finally:
+        urllib.request.urlopen = orig
+    check("responses: 无 response.completed 时用 output_item.done 兜底",
+          result["blocks"] == [{"type": "text", "text": text}]
+          and "".join(texts) == text, str(result["blocks"]))
+
+
 def test_tools(workdir):
     print("\n[3] 工具函数单元测试")
     from aichat import agent as A
@@ -861,6 +1204,38 @@ def test_ui(workdir):
     win.grab().save(os.path.join(hist_dir, "render_thinking_history.png"))
     check("含思考块历史渲染无崩溃", True)
 
+    # 停止生成按钮：双态切换 + 空闲时停止无副作用
+    win._set_requesting_state(True)
+    check("停止按钮: 请求中变为停止态",
+          win.send_btn.text() == "⏹ 停止" and win._request_active, win.send_btn.text())
+    win._stop_generation()
+    check("停止按钮: 停止后恢复发送态",
+          win.send_btn.text() == "发送" and not win._request_active, win.send_btn.text())
+
+    # 错误气泡移除判定：有工具卡片/思考卡的气泡不算空
+    we = win.add_message_widget("assistant", "")
+    check("is_empty: 空气泡为空", we.is_empty())
+    we.add_tool_call("te", "bash", "{}")
+    check("is_empty: 有工具卡片不为空", not we.is_empty())
+    we2 = win.add_message_widget("assistant", "")
+    we2.stream_thinking("思考")
+    check("is_empty: 有思考卡不为空", not we2.is_empty())
+
+    # 工具确认批准器：stop() 主动唤醒等待中的线程
+    from aichat.agent import AgentWorker, ToolApprover
+    worker_ap = AgentWorker(messages=[], fmt="anthropic", api_key="k",
+                            base_url="http://127.0.0.1:1", model="m")
+    pending = ToolApprover()
+    worker_ap._pending_approver = pending
+    worker_ap.stop()
+    check("stop(): 唤醒卡在确认等待的批准器（按拒绝处理）",
+          pending._event.is_set() and pending.approved is False)
+
+    # gpt-5 属于多模态模型，不应误报视觉警告
+    win.model = "gpt-5"
+    win.supports_vision = False
+    check("视觉检测: gpt-5 不再误报", win._check_model_supports_vision())
+
     # 小狗各姿态渲染 + AI 状态联动
     win.puppy_widget._t = 1.2
     for pose in ("sit", "walk", "run", "drowsy", "sleep", "stretch",
@@ -915,11 +1290,17 @@ def main():
     workdir = tempfile.mkdtemp(prefix="aichat_w_")
     try:
         test_ui(workdir)          # 先建 QApplication，供后续 QThread 使用
+        test_stop_generation()
         test_api_clients(base)
         test_api_block_start_input()
         test_agent_worker(base, workdir)
         test_thinking_support(base)
         test_thinking_degrade()
+        test_error_history_writeback()
+        test_retry_backoff()
+        test_context_window()
+        test_encoding_tools(workdir)
+        test_responses_done_fallback()
         test_tools(workdir)
         test_normalize()
     finally:
