@@ -1,8 +1,8 @@
-"""消息展示组件：Markdown 渲染、代码块、工具调用卡片、消息气泡。
+"""消息展示组件：Markdown 渲染、代码块、工具调用卡片、思考过程卡片、消息气泡。
 
 MessageWidget 支持两种内容形态：
 - 纯文本（用户消息 / 旧版历史）
-- 内容块列表（agent 消息流：文本段与工具调用交错出现）
+- 内容块列表（agent 消息流：思考/文本段与工具调用交错出现）
 """
 
 import base64
@@ -552,6 +552,128 @@ class ToolCallWidget(QFrame):
                 pass
 
 
+# ==================== 思考过程卡片 ====================
+
+class ThinkingWidget(QFrame):
+    """思考过程卡片：默认折叠，标题行实时预览，点击展开完整内容"""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self.thinking_text = ""
+        self.expanded = False
+        self.setObjectName("thinkingCard")
+        self.setStyleSheet("""
+            QFrame#thinkingCard {
+                background: #fafbfe;
+                border: 1px dashed #cbd5e0;
+                border-radius: 10px;
+            }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.toggle_label = QLabel("▸")
+        self.toggle_label.setStyleSheet(
+            "color: #718096; font-size: 12px; background: transparent; border: none;")
+        header.addWidget(self.toggle_label)
+
+        self.title_label = QLabel("💭 思考过程")
+        self.title_label.setStyleSheet("""
+            QLabel {
+                color: #805ad5; font-size: 13px; font-weight: 600;
+                background: transparent; border: none;
+            }
+        """)
+        header.addWidget(self.title_label)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "color: #a0aec0; font-size: 12px; font-style: italic;"
+            "background: transparent; border: none;")
+        self.preview_label.setVisible(False)
+        header.addWidget(self.preview_label, 1)
+        layout.addLayout(header)
+
+        self.browser = QTextBrowser()
+        self.browser.setReadOnly(True)
+        self.browser.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        self.browser.setOpenExternalLinks(False)
+        self.browser.setVisible(False)
+        self.browser.setStyleSheet("""
+            QTextBrowser {
+                background: #ffffff; color: #4a5568;
+                border: 1px solid #e2e8f0; border-radius: 8px;
+                font-size: 13px; padding: 8px;
+            }
+        """)
+        self.browser.setFixedHeight(200)
+        layout.addWidget(self.browser)
+
+        if text:
+            self.thinking_text = text
+            self._refresh_preview()
+            self.finish()
+
+        self.setCursor(Qt.PointingHandCursor)
+
+    # ----- 流式 API -----
+
+    def append(self, delta: str):
+        """追加思考增量；展开状态下实时滚动"""
+        self.thinking_text += delta
+        self.title_label.setText("💭 思考中…")
+        self._refresh_preview()
+        if self.expanded:
+            self._update_browser()
+            bar = self.browser.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def finish(self):
+        """思考结束：标题恢复常驻文案"""
+        self.title_label.setText("💭 思考过程")
+        self._refresh_preview()
+
+    def select_all(self):
+        try:
+            self.browser.selectAll()
+        except RuntimeError:
+            pass
+
+    # ----- 内部 -----
+
+    def _refresh_preview(self):
+        compact = " ".join(self.thinking_text.split())
+        if not compact:
+            self.preview_label.setVisible(False)
+            return
+        tail = compact[-60:]
+        self.preview_label.setText(("…" if len(compact) > 60 else "") + tail)
+        self.preview_label.setVisible(True)
+
+    def _update_browser(self):
+        escaped = (self.thinking_text
+                   .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+        self.browser.setHtml(
+            f"<pre style='margin:0; white-space: pre-wrap; "
+            f"word-wrap: break-word;'>{escaped}</pre>")
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.expanded = not self.expanded
+            if self.expanded:
+                self._update_browser()
+                bar = self.browser.verticalScrollBar()
+                bar.setValue(bar.maximum())
+            self.browser.setVisible(self.expanded)
+            self.toggle_label.setText("▾" if self.expanded else "▸")
+        super().mouseReleaseEvent(event)
+
+
 # ==================== 消息气泡 ====================
 
 class MessageWidget(QFrame):
@@ -573,6 +695,8 @@ class MessageWidget(QFrame):
         self._cached_code_blocks: List[CodeBlockWidget] = []
         self._all_text_browsers: List[QTextBrowser] = []
         self._tool_widgets = {}  # call_id -> ToolCallWidget
+        self._thinking_widgets: List[ThinkingWidget] = []
+        self._active_thinking: Optional[ThinkingWidget] = None
 
         self.parser = get_markdown_parser()
         self.setFocusPolicy(Qt.StrongFocus)
@@ -652,7 +776,7 @@ class MessageWidget(QFrame):
         return "\n\n".join(p for p in parts if p.strip())
 
     def _render_assistant_content(self, content_h_layout):
-        """渲染 AI 消息：文本段与工具调用卡片按顺序交错"""
+        """渲染 AI 消息：思考/文本段与工具调用卡片按顺序交错"""
         content = self.raw_content
         if isinstance(content, list):
             for block in content:
@@ -661,6 +785,13 @@ class MessageWidget(QFrame):
                     text = block.get("text", "")
                     if text.strip():
                         self.parse_content(self.text_layout, text, user=False)
+                elif btype == "thinking":
+                    text = block.get("thinking", "")
+                    if text.strip():
+                        self._append_thinking_widget(ThinkingWidget(text))
+                elif btype == "redacted_thinking":
+                    self._append_thinking_widget(
+                        ThinkingWidget("🔒 此思考内容已加密，无法展示。"))
                 elif btype == "tool_use":
                     self._append_tool_widget(
                         block.get("id", ""), block.get("name", ""),
@@ -686,10 +817,28 @@ class MessageWidget(QFrame):
             self._tool_widgets[call_id] = widget
         return widget
 
+    def _append_thinking_widget(self, widget: ThinkingWidget) -> ThinkingWidget:
+        self.text_layout.addWidget(widget)
+        self._thinking_widgets.append(widget)
+        return widget
+
     # ----- 流式 API（ChatWindow 在 agent 回合中调用）-----
+
+    def stream_thinking(self, delta: str):
+        """追加一段思考过程增量（默认折叠的 💭 卡片，独立于正文）"""
+        if self._active_thinking is None:
+            self._active_thinking = self._append_thinking_widget(ThinkingWidget())
+        self._active_thinking.append(delta)
+
+    def _seal_thinking(self):
+        """结束当前思考段（正文/工具调用开始时调用）"""
+        if self._active_thinking is not None:
+            self._active_thinking.finish()
+            self._active_thinking = None
 
     def stream_append(self, delta: str):
         """追加一段流式文本（在当前打开的文本段中）"""
+        self._seal_thinking()
         self._stream_text += delta
         if self._cached_text_browser is None:
             text_browser = QTextBrowser()
@@ -719,6 +868,7 @@ class MessageWidget(QFrame):
 
     def seal_stream(self):
         """封存当前流式文本段：转为最终 Markdown 渲染"""
+        self._seal_thinking()
         if self._cached_text_browser is None:
             return
         text = self._stream_text
@@ -737,6 +887,7 @@ class MessageWidget(QFrame):
             self.parse_content(self.text_layout, text, user=False)
 
     def add_tool_call(self, call_id: str, name: str, args_json: str) -> ToolCallWidget:
+        self._seal_thinking()
         return self._append_tool_widget(call_id, name, args_json)
 
     def set_tool_result(self, call_id: str, result_text: str, ok: bool):
@@ -926,6 +1077,8 @@ class MessageWidget(QFrame):
                 pass
         for tool_widget in self._tool_widgets.values():
             tool_widget.select_all()
+        for thinking_widget in self._thinking_widgets:
+            thinking_widget.select_all()
         if self._cached_text_browser:
             try:
                 self._cached_text_browser.selectAll()

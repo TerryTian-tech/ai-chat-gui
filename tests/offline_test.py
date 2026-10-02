@@ -32,7 +32,8 @@ def check(name, cond, detail=""):
 # ==================== SSE 片段构造 ====================
 
 def anth_events(blocks):
-    """生成 Anthropic 流式事件序列（blocks: [('text', str) | ('tool_use', id, name, json_str)]）"""
+    """生成 Anthropic 流式事件序列（blocks: [('thinking', str, sig) | ('text', str)
+    | ('tool_use', id, name, json_str)]）"""
     lines = [
         "event: message_start",
         'data: {"type":"message_start","message":{"id":"msg_t","role":"assistant","content":[]}}',
@@ -40,7 +41,23 @@ def anth_events(blocks):
     ]
     idx = 0
     for block in blocks:
-        if block[0] == "text":
+        if block[0] == "thinking":
+            _, think_text, sig = block
+            lines += ["event: content_block_start",
+                      "data: " + json.dumps({"type": "content_block_start", "index": idx,
+                                  "content_block": {"type": "thinking", "thinking": ""}}), ""]
+            for i in range(0, len(think_text), 5):
+                lines += ["event: content_block_delta",
+                          "data: " + json.dumps({"type": "content_block_delta", "index": idx,
+                                      "delta": {"type": "thinking_delta",
+                                                "thinking": think_text[i:i + 5]}}), ""]
+            if sig:
+                lines += ["event: content_block_delta",
+                          "data: " + json.dumps({"type": "content_block_delta", "index": idx,
+                                      "delta": {"type": "signature_delta", "signature": sig}}), ""]
+            lines += ["event: content_block_stop",
+                      "data: " + json.dumps({"type": "content_block_stop", "index": idx}), ""]
+        elif block[0] == "text":
             text = block[1]
             lines += ["event: content_block_start",
                       "data: " + json.dumps({"type": "content_block_start", "index": idx,
@@ -73,12 +90,29 @@ def anth_events(blocks):
 
 
 def resp_events(items):
-    """生成 Responses 流式事件序列（items: [('text', str) | ('call', call_id, name, args_json)]）"""
+    """生成 Responses 流式事件序列（items: [('reasoning', str) | ('text', str)
+    | ('call', call_id, name, args_json)]）"""
     lines = ['event: response.created',
              'data: {"type":"response.created","response":{"id":"resp_t"}}', ""]
     final_output = []
     for i, item in enumerate(items):
-        if item[0] == "text":
+        if item[0] == "reasoning":
+            _, rtext = item
+            lines += ["event: response.output_item.added",
+                      "data: " + json.dumps({"type": "response.output_item.added", "output_index": i,
+                                  "item": {"type": "reasoning", "id": f"rs_{i}", "summary": []}}), ""]
+            for j in range(0, len(rtext), 5):
+                lines += ["event: response.reasoning_summary_text.delta",
+                          "data: " + json.dumps({"type": "response.reasoning_summary_text.delta",
+                                      "output_index": i, "summary_index": 0,
+                                      "delta": rtext[j:j + 5]}), ""]
+            done_item = {"type": "reasoning", "id": f"rs_{i}",
+                         "summary": [{"type": "summary_text", "text": rtext}]}
+            lines += ["event: response.output_item.done",
+                      "data: " + json.dumps({"type": "response.output_item.done", "output_index": i,
+                                  "item": done_item}), ""]
+            final_output.append(done_item)
+        elif item[0] == "text":
             text = item[1]
             lines += ["event: response.output_item.added",
                       "data: " + json.dumps({"type": "response.output_item.added", "output_index": i,
@@ -118,6 +152,7 @@ def resp_events(items):
 # ==================== 模拟服务器 ====================
 
 RECEIVED = []  # 每个请求的 {"path", "headers", "body"}
+FLAGS = {"anth_thinking": False, "resp_reasoning": False}  # 思考脚本开关
 
 
 class FakeAPIHandler(BaseHTTPRequestHandler):
@@ -164,24 +199,34 @@ class FakeAPIHandler(BaseHTTPRequestHandler):
         return False
 
     def _anthropic_sse(self, body):
+        blocks = []
+        if FLAGS["anth_thinking"]:
+            blocks.append(("thinking", "我先想一下……", "sigSIGsig"))
         if self._has_tool_result(body):
-            return anth_events([("text", "文件已写入，小狗汪汪！")])
-        return anth_events([
+            blocks.append(("text", "文件已写入，小狗汪汪！"))
+            return anth_events(blocks)
+        blocks += [
             ("text", "我来创建文件。"),
             ("tool_use", "toolu_01", "write",
              json.dumps({"path": "hello.txt", "content": "小狗汪汪"})),
             ("tool_use", "toolu_02", "read", json.dumps({"path": "hello.txt"})),
-        ])
+        ]
+        return anth_events(blocks)
 
     def _responses_sse(self, body):
+        items = []
+        if FLAGS["resp_reasoning"]:
+            items.append(("reasoning", "先想想再答。"))
         if self._has_tool_result(body):
-            return resp_events([("text", "Done, woof!")])
-        return resp_events([
+            items.append(("text", "Done, woof!"))
+            return resp_events(items)
+        items += [
             ("text", "Creating file now."),
             ("call", "call_01", "write",
              json.dumps({"path": "hello.txt", "content": "puppy woof"})),
             ("call", "call_02", "bash", json.dumps({"cmd": "echo hi-dog"})),
-        ])
+        ]
+        return resp_events(items)
 
 
 def start_server():
@@ -314,6 +359,48 @@ class ErrHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class FailFirstHandler(BaseHTTPRequestHandler):
+    """前 fail_count 次请求返回 400（消息可配置），之后返回正常 SSE。
+
+    用于验证：思考参数被服务端拒绝（模型不支持思考 / max_tokens 超输出上限）时
+    客户端自动去掉参数降级重试一次。
+    """
+    protocol_version = "HTTP/1.1"
+    calls = []  # [(path, body)]
+    error_message = ("max_tokens: 20480 > 8192, which is the maximum allowed number "
+                     "of output tokens; thinking is not supported by this model")
+    fail_count = 1
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        type(self).calls.append((self.path, body))
+        if len(type(self).calls) <= type(self).fail_count:
+            payload = json.dumps({"error": {"message": type(self).error_message}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path.endswith("/messages"):
+            sse = anth_events([("text", "降级成功")])
+        else:
+            sse = resp_events([("text", "degraded ok")])
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        data = sse.encode("utf-8")
+        for i in range(0, len(data), 64):
+            piece = data[i:i + 64]
+            self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+        self.wfile.write(b"0\r\n\r\n")
+
+
 def test_agent_worker(base, workdir):
     print("\n[2] AgentWorker 端到端（工具真实执行 + agentic 循环）")
     from aichat.agent import AgentWorker
@@ -384,6 +471,197 @@ def test_agent_worker(base, workdir):
     worker3.run()
     check("普通聊天: 请求不含 tools 字段", "tools" not in RECEIVED[0]["body"])
     check("普通聊天: 文本正常流式", "".join(chunks3).startswith("我来创建文件。"))
+
+
+def test_thinking_support(base):
+    print("\n[3] 思考强度端到端（payload 注入 + 思考流解析 + 历史回传）")
+    from aichat.agent import AgentWorker
+    from aichat.api import (AnthropicClient, ResponsesClient,
+                            message_to_responses_items)
+
+    # --- Anthropic：开启 → payload 注入 thinking + max_tokens 抬高 ---
+    AnthropicClient("sk-test", base, "test-model", "medium").stream(
+        [{"role": "user", "content": "hi"}], "s")
+    req = RECEIVED[-1]
+    check("anthropic: thinking 参数按档位注入",
+          req["body"]["thinking"] == {"type": "enabled", "budget_tokens": 8192},
+          str(req["body"].get("thinking")))
+    check("anthropic: max_tokens 抬到 budget+4096",
+          req["body"]["max_tokens"] == 12288, str(req["body"]["max_tokens"]))
+
+    # --- Anthropic：关闭 → 不注入，且历史思考块被剥离 ---
+    AnthropicClient("sk-test", base, "test-model", "off").stream(
+        [{"role": "user", "content": "hi"},
+         {"role": "assistant", "content": [
+             {"type": "thinking", "thinking": "x", "signature": "sg"},
+             {"type": "text", "text": "done"}]}], "s")
+    req = RECEIVED[-1]
+    check("anthropic: 关闭时不含 thinking 参数", "thinking" not in req["body"])
+    check("anthropic: 关闭时历史思考块被剥离",
+          all(b.get("type") != "thinking"
+              for m in req["body"]["messages"] if isinstance(m.get("content"), list)
+              for b in m["content"]))
+    check("anthropic: 非法档位回退为 off",
+          AnthropicClient("k", base, "m", "extreme").thinking_effort == "off")
+
+    FLAGS["anth_thinking"] = True
+    FLAGS["resp_reasoning"] = True
+    try:
+        # --- Anthropic：思考流解析（独立回调 + 签名完整）---
+        texts, thinks = [], []
+        result = AnthropicClient("k", base, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s",
+            on_text=texts.append, on_thinking=thinks.append)
+        check("anthropic: 思考增量走独立回调", "".join(thinks) == "我先想一下……", repr(thinks))
+        check("anthropic: 正文增量不受思考污染", "".join(texts) == "我来创建文件。", repr(texts))
+        tb = result["blocks"][0]
+        check("anthropic: 思考块排最前且签名完整",
+              tb["type"] == "thinking" and tb["thinking"] == "我先想一下……"
+              and tb["signature"] == "sigSIGsig", str(tb))
+        check("anthropic: 高档位 max_tokens=20480",
+              RECEIVED[-1]["body"]["max_tokens"] == 20480, str(RECEIVED[-1]["body"]["max_tokens"]))
+
+        # --- Responses：reasoning.effort + 摘要增量 + reasoning item 转换 ---
+        thinks2 = []
+        result2 = ResponsesClient("k", base, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s", on_thinking=thinks2.append)
+        req2 = RECEIVED[-1]
+        check("responses: reasoning.effort 注入",
+              req2["body"]["reasoning"] == {"effort": "high"}, str(req2["body"].get("reasoning")))
+        check("responses: 思考摘要增量回调", "".join(thinks2) == "先想想再答。", repr(thinks2))
+        check("responses: reasoning item → thinking 块",
+              result2["blocks"][0].get("type") == "thinking"
+              and result2["blocks"][0]["thinking"] == "先想想再答。", str(result2["blocks"]))
+
+        items = message_to_responses_items({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "嗯", "signature": "s"},
+            {"type": "text", "text": "hi"}]})
+        check("responses: 历史思考块不回传",
+              len(items) == 1 and items[0]["content"]["text"] == "hi", str(items))
+
+        # --- Agent 循环：思考块保留进历史并原样回传 ---
+        workdir3 = tempfile.mkdtemp(prefix="aichat_t3_")
+        events3 = {"chunks": [], "thinks": [], "history": None, "error": None}
+        worker = AgentWorker(
+            messages=[{"role": "user", "content": "创建 hello2.txt"}],
+            fmt="anthropic", api_key="sk", base_url=base, model="m",
+            agent_mode=True, workdir=workdir3, confirm_tools=False,
+            thinking_effort="high")
+        worker.stream_chunk.connect(events3["chunks"].append)
+        worker.thinking_chunk.connect(events3["thinks"].append)
+        worker.history_ready.connect(lambda h: events3.update(history=h))
+        worker.error_occurred.connect(lambda e: events3.update(error=e))
+        worker.run()
+        check("agent(thinking): 无错误完成", events3["error"] is None, str(events3["error"]))
+        check("agent(thinking): 思考增量信号", "我先想一下……" in "".join(events3["thinks"]))
+        history = events3["history"]
+        a1 = next(m for m in history if m["role"] == "assistant")
+        check("agent(thinking): 思考块排最前且签名保留",
+              a1["content"][0]["type"] == "thinking"
+              and a1["content"][0]["signature"] == "sigSIGsig", str(a1["content"][0]))
+        tool_reqs = [r for r in RECEIVED if r["path"].endswith("/messages")
+                     and any(isinstance(m.get("content"), list)
+                             and any(b.get("type") == "tool_result" for b in m["content"])
+                             for m in r["body"].get("messages", []))]
+        check("agent(thinking): 下一轮请求原样回传思考块",
+              bool(tool_reqs) and tool_reqs[0]["body"]["messages"][1]["content"][0]
+              .get("signature") == "sigSIGsig",
+              str(tool_reqs[0]["body"]["messages"][1] if tool_reqs else None))
+        shutil.rmtree(workdir3, ignore_errors=True)
+    finally:
+        FLAGS["anth_thinking"] = False
+        FLAGS["resp_reasoning"] = False
+
+
+def test_thinking_degrade():
+    print("\n[3.5] 思考参数被拒的降级保护（空 content 占位 + 自动重试一次）")
+    from aichat.api import MAX_TOKENS, AnthropicClient, ResponsesClient, ApiError
+
+    # 空 content 占位：思考阶段被截断的回合（只有 thinking 块），关档位剥离后不再产生空数组
+    stripped = AnthropicClient._strip_thinking({"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "被截断的思考", "signature": "sig"}]})
+    check("strip thinking-only: 空 content 换占位文本块",
+          stripped["content"] == [{"type": "text", "text": "[thinking omitted]"}],
+          str(stripped["content"]))
+    mixed = AnthropicClient._strip_thinking({"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "x", "signature": "s"},
+        {"type": "text", "text": "答案"}]})
+    check("strip: 混合块正常保留正文",
+          [b["type"] for b in mixed["content"]] == ["text"]
+          and mixed["content"][0]["text"] == "答案", str(mixed["content"]))
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FailFirstHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    dbase = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        # --- Anthropic：高档位撞 8192 输出上限 → 400 → 去掉思考参数重试一次 ---
+        FailFirstHandler.calls.clear()
+        texts = []
+        AnthropicClient("k", dbase, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s", on_text=texts.append)
+        _, first = FailFirstHandler.calls[0]
+        _, second = FailFirstHandler.calls[1]
+        check("anthropic: 首请求带 thinking + 抬高的 max_tokens",
+              first.get("thinking") == {"type": "enabled", "budget_tokens": 16384}
+              and first["max_tokens"] == 20480,
+              f"{first.get('thinking')} / {first['max_tokens']}")
+        check("anthropic: 重试请求已去 thinking 且 max_tokens 复位",
+              "thinking" not in second and second["max_tokens"] == MAX_TOKENS,
+              f"{second.get('thinking')} / {second['max_tokens']}")
+        check("anthropic: 降级后正文正常到达", "".join(texts) == "降级成功", repr(texts))
+
+        # --- Responses：reasoning 参数被拒 → 降级 ---
+        FailFirstHandler.calls.clear()
+        texts2 = []
+        ResponsesClient("k", dbase, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s", on_text=texts2.append)
+        _, rfirst = FailFirstHandler.calls[0]
+        _, rsecond = FailFirstHandler.calls[1]
+        check("responses: 首请求带 reasoning.effort，重试已去掉",
+              rfirst.get("reasoning") == {"effort": "high"}
+              and "reasoning" not in rsecond,
+              f"{rfirst.get('reasoning')} / {rsecond.get('reasoning')}")
+        check("responses: 降级后正文正常到达", "".join(texts2) == "degraded ok", repr(texts2))
+
+        # --- 错误与思考参数无关 → 不重试，原样抛出 ---
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_message = "invalid x-api-key"
+        try:
+            AnthropicClient("k", dbase, "m", "high").stream(
+                [{"role": "user", "content": "hi"}], "s")
+            check("anthropic: 无关 400 不触发重试", False)
+        except ApiError as e:
+            check("anthropic: 无关 400 不触发重试",
+                  "invalid" in str(e) and len(FailFirstHandler.calls) == 1, str(e))
+
+        # --- 档位关闭 → 即使错误提到 thinking 也不重试（参数本就没发）---
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_message = "thinking is not supported"
+        try:
+            AnthropicClient("k", dbase, "m", "off").stream(
+                [{"role": "user", "content": "hi"}], "s")
+            check("anthropic: off 档位不触发重试", False)
+        except ApiError:
+            check("anthropic: off 档位不触发重试",
+                  len(FailFirstHandler.calls) == 1, str(len(FailFirstHandler.calls)))
+
+        # --- 关闭档位 + 思考截断历史 → 请求体带占位文本块而非空 content ---
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.fail_count = 0  # 不再拒绝，放行所有请求
+        AnthropicClient("k", dbase, "m", "off").stream(
+            [{"role": "user", "content": "hi"},
+             {"role": "assistant", "content": [
+                 {"type": "thinking", "thinking": "只思考了", "signature": "s"}]}], "s")
+        _, body = FailFirstHandler.calls[0]
+        a_content = body["messages"][1]["content"]
+        check("anthropic: 思考截断历史 → 占位文本块而非空 content",
+              a_content == [{"type": "text", "text": "[thinking omitted]"}], str(a_content))
+    finally:
+        FailFirstHandler.error_message = ("max_tokens: 20480 > 8192, which is the maximum "
+                                          "allowed number of output tokens; thinking is not "
+                                          "supported by this model")
+        FailFirstHandler.fail_count = 1
+        server.shutdown()
 
 
 def test_tools(workdir):
@@ -550,6 +828,39 @@ def test_ui(workdir):
     w.set_tool_result("t9", "hi\n", True)
     check("MessageWidget 流式 + 工具卡片 API", tw.result_text == "hi\n")
 
+    # 思考卡片：流式增量 → 独立折叠卡片，不计入正文
+    wt = win.add_message_widget("assistant", "")
+    wt.stream_thinking("先拆解问题")
+    wt.stream_thinking("，再给答案")
+    card = wt._thinking_widgets[0]
+    check("思考卡片创建且默认折叠",
+          card.expanded is False and not card.browser.isVisible()
+          and card.title_label.text() == "💭 思考中…", card.title_label.text())
+    card.expanded = True
+    card._update_browser()
+    card.browser.setVisible(True)
+    check("思考卡片展开可见内容", card.browser.toPlainText() == "先拆解问题，再给答案",
+          card.browser.toPlainText())
+    wt.stream_append("答案正文")
+    wt.seal_stream()
+    check("思考结束后标题复位且不计入正文",
+          card.title_label.text() == "💭 思考过程" and wt.get_all_text() == "答案正文",
+          repr(wt.get_all_text()))
+    wt.grab().save(os.path.join(hist_dir, "render_thinking.png"))
+
+    # 含思考块的历史消息渲染（重新加载路径）；追加而非覆盖，
+    # 保留 tool_use 内容供保存/加载往返断言
+    conv["messages"] += [
+        {"role": "user", "content": "想一下"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "内部推理过程……", "signature": "sig1"},
+            {"type": "text", "text": "想好了。"},
+        ]},
+    ]
+    win.load_conversation_messages()
+    win.grab().save(os.path.join(hist_dir, "render_thinking_history.png"))
+    check("含思考块历史渲染无崩溃", True)
+
     # 小狗各姿态渲染 + AI 状态联动
     win.puppy_widget._t = 1.2
     for pose in ("sit", "walk", "run", "drowsy", "sleep", "stretch",
@@ -571,12 +882,27 @@ def test_ui(workdir):
     pw.set_run_flag("process", False)
     check("进程结束回到平静", pw._pose == "stretch", pw._pose)
 
+    # 设置对话框：思考强度档位往返
+    from aichat.window import SettingsDialog
+    dlg = SettingsDialog()
+    check("设置对话框: 思考强度下拉含 4 档", dlg.thinking_combo.count() == 4)
+    dlg.thinking_combo.setCurrentIndex(3)
+    check("设置对话框: get_settings 携带 thinking_effort",
+          dlg.get_settings()["thinking_effort"] == "high")
+    dlg.thinking_combo.setCurrentIndex(0)
+    check("设置对话框: 关闭档位为 off", dlg.get_settings()["thinking_effort"] == "off")
+
     # 保存/加载往返
     win.save_conversations(delay=False)
     win2 = ChatWindow()
     check("历史保存/加载往返", len(win2.conversations) >= 1
           and any("tool_use" in str(m) for c in win2.conversations.values()
                   for m in c["messages"]))
+    check("思考块含签名往返保留", any(
+        isinstance(m.get("content"), list)
+        and any(b.get("type") == "thinking" and b.get("signature") == "sig1"
+                for b in m["content"])
+        for c in win2.conversations.values() for m in c["messages"]))
     for w in (win, win2):
         w.process_monitor.stop()
         w.process_monitor.wait(2000)
@@ -592,6 +918,8 @@ def main():
         test_api_clients(base)
         test_api_block_start_input()
         test_agent_worker(base, workdir)
+        test_thinking_support(base)
+        test_thinking_degrade()
         test_tools(workdir)
         test_normalize()
     finally:

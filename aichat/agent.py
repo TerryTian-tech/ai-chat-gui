@@ -295,6 +295,7 @@ class AgentWorker(QThread):
     """后台 agent 循环线程（也承担无工具的普通聊天请求）"""
 
     stream_chunk = Signal(str)            # 文本增量
+    thinking_chunk = Signal(str)          # 思考过程增量（独立于正文）
     tool_call_started = Signal(str, str, str)   # call_id, name, args_json
     tool_call_finished = Signal(str, str, bool)  # call_id, result, ok
     confirm_requested = Signal(str, str, object)  # name, args_display, ToolApprover
@@ -304,7 +305,7 @@ class AgentWorker(QThread):
 
     def __init__(self, messages, fmt, api_key, base_url, model,
                  agent_mode=False, workdir=".", confirm_tools=True,
-                 system_prompt=SYSTEM_PROMPT):
+                 thinking_effort="off", system_prompt=SYSTEM_PROMPT):
         super().__init__()
         self.messages = copy.deepcopy(messages)
         self.fmt = fmt
@@ -314,6 +315,7 @@ class AgentWorker(QThread):
         self.agent_mode = agent_mode
         self.workdir = workdir
         self.confirm_tools = confirm_tools
+        self.thinking_effort = thinking_effort
         self.system_prompt = system_prompt
         self._running = True
 
@@ -328,7 +330,8 @@ class AgentWorker(QThread):
                 self.error_occurred.emit(str(e))
 
     def _run_loop(self):
-        client = make_client(self.fmt, self.api_key, self.base_url, self.model)
+        client = make_client(self.fmt, self.api_key, self.base_url, self.model,
+                             self.thinking_effort)
         system = self.system_prompt
         tools = make_tool_schema() if self.agent_mode else None
         if self.agent_mode:
@@ -343,10 +346,17 @@ class AgentWorker(QThread):
                 system,
                 tools=tools,
                 on_text=lambda d: self.stream_chunk.emit(d),
+                on_thinking=lambda d: self.thinking_chunk.emit(d),
                 is_cancelled=lambda: not self._running,
             )
+            # 保留思考块：Anthropic 在思考 + 工具调用时要求下一轮原样回传
+            # thinking 块（含 signature），剥掉会直接 400
             blocks = [b for b in result["blocks"]
-                      if b.get("type") in ("text", "tool_use")]
+                      if b.get("type") in ("text", "tool_use",
+                                           "thinking", "redacted_thinking")]
+            # 思考块必须排在 assistant content 数组最前
+            blocks.sort(key=lambda b: 0 if b.get("type") in ("thinking",
+                                                             "redacted_thinking") else 1)
             self.messages.append({"role": "assistant", "content": blocks})
 
             tool_uses = [b for b in blocks if b["type"] == "tool_use"]

@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
 )
 
 from .agent import AgentWorker
-from .api import ANTHROPIC, FORMAT_LABELS, RESPONSES, normalize_history_message
+from .api import (ANTHROPIC, FORMAT_LABELS, RESPONSES, THINKING_HIGH,
+                  THINKING_LOW, THINKING_MEDIUM, THINKING_OFF,
+                  normalize_history_message, normalize_thinking_effort)
 from .pet import PuppyWidget
 from .widgets import MessageWidget
 
@@ -80,6 +82,20 @@ class SettingsDialog(QDialog):
         self.model_edit = QLineEdit()
         self.model_edit.setPlaceholderText("例如 claude-sonnet-4-5 / gpt-5 / deepseek-chat")
         form.addWidget(self.model_edit)
+
+        form.addWidget(QLabel("思考强度:"))
+        self.thinking_combo = QComboBox()
+        self.thinking_combo.addItem("关闭（不发送思考参数）", THINKING_OFF)
+        self.thinking_combo.addItem("低", THINKING_LOW)
+        self.thinking_combo.addItem("中", THINKING_MEDIUM)
+        self.thinking_combo.addItem("高", THINKING_HIGH)
+        self.thinking_combo.setToolTip(
+            "推理模型的思考预算，同时作用于聊天与 Agent。\n"
+            "Anthropic → thinking.budget_tokens（低 2048 / 中 8192 / 高 16384，\n"
+            "max_tokens 自动抬高）；OpenAI Responses → reasoning.effort。\n"
+            "模型不支持思考或超出输出上限时，会自动去掉思考参数降级重试。")
+        self._style_combo(self.thinking_combo)
+        form.addWidget(self.thinking_combo)
 
         self.vision_checkbox = QCheckBox("此模型支持图片输入（多模态）")
         self.vision_checkbox.setStyleSheet("font-size: 13px; color: #4a5568;")
@@ -173,6 +189,9 @@ class SettingsDialog(QDialog):
         self.api_key_edit.setText(settings.value("api_key", ""))
         self.base_url_edit.setText(settings.value("base_url", ""))
         self.model_edit.setText(settings.value("model", ""))
+        effort_idx = self.thinking_combo.findData(
+            normalize_thinking_effort(settings.value("thinking_effort", THINKING_OFF)))
+        self.thinking_combo.setCurrentIndex(max(effort_idx, 0))
         self.vision_checkbox.setChecked(settings.value("supports_vision", False, type=bool))
         self.workdir_edit.setText(settings.value("workdir", ""))
         self.confirm_checkbox.setChecked(settings.value("confirm_tools", True, type=bool))
@@ -183,6 +202,7 @@ class SettingsDialog(QDialog):
         settings.setValue("api_key", self.api_key_edit.text())
         settings.setValue("base_url", self.base_url_edit.text())
         settings.setValue("model", self.model_edit.text())
+        settings.setValue("thinking_effort", self.thinking_combo.currentData())
         settings.setValue("supports_vision", self.vision_checkbox.isChecked())
         settings.setValue("workdir", self.workdir_edit.text())
         settings.setValue("confirm_tools", self.confirm_checkbox.isChecked())
@@ -201,6 +221,7 @@ class SettingsDialog(QDialog):
             "api_key": self.api_key_edit.text(),
             "base_url": self.base_url_edit.text(),
             "model": self.model_edit.text(),
+            "thinking_effort": self.thinking_combo.currentData(),
             "supports_vision": self.vision_checkbox.isChecked(),
             "workdir": self.workdir_edit.text(),
             "confirm_tools": self.confirm_checkbox.isChecked(),
@@ -345,6 +366,8 @@ class ChatWindow(QMainWindow):
         self.api_key = settings.value("api_key", "")
         self.base_url = settings.value("base_url", "")
         self.model = settings.value("model", "")
+        self.thinking_effort = normalize_thinking_effort(
+            settings.value("thinking_effort", THINKING_OFF))
         self.supports_vision = settings.value("supports_vision", False, type=bool)
         self.workdir = settings.value("workdir", "")
         self.confirm_tools = settings.value("confirm_tools", True, type=bool)
@@ -624,6 +647,7 @@ class ChatWindow(QMainWindow):
             self.api_key = s["api_key"]
             self.base_url = s["base_url"]
             self.model = s["model"]
+            self.thinking_effort = normalize_thinking_effort(s["thinking_effort"])
             self.supports_vision = s["supports_vision"]
             self.workdir = s["workdir"]
             self.confirm_tools = s["confirm_tools"]
@@ -788,6 +812,7 @@ class ChatWindow(QMainWindow):
             self.api_worker.stop()
             try:
                 self.api_worker.stream_chunk.disconnect()
+                self.api_worker.thinking_chunk.disconnect()
                 self.api_worker.tool_call_started.disconnect()
                 self.api_worker.tool_call_finished.disconnect()
                 self.api_worker.confirm_requested.disconnect()
@@ -1012,8 +1037,10 @@ class ChatWindow(QMainWindow):
             agent_mode=self.agent_mode,
             workdir=self.workdir or os.getcwd(),
             confirm_tools=self.confirm_tools,
+            thinking_effort=self.thinking_effort,
         )
         self.api_worker.stream_chunk.connect(self.on_stream_chunk)
+        self.api_worker.thinking_chunk.connect(self.on_thinking_chunk)
         self.api_worker.tool_call_started.connect(self.on_tool_call_started)
         self.api_worker.tool_call_finished.connect(self.on_tool_call_finished)
         self.api_worker.confirm_requested.connect(self.on_confirm_requested)
@@ -1032,6 +1059,17 @@ class ChatWindow(QMainWindow):
         if self.current_ai_widget:
             try:
                 self.current_ai_widget.stream_append(chunk)
+            except RuntimeError:
+                self.current_ai_widget = None
+                return
+        self.scroll_to_bottom()
+
+    def on_thinking_chunk(self, chunk: str):
+        if self._request_stale():
+            return
+        if self.current_ai_widget:
+            try:
+                self.current_ai_widget.stream_thinking(chunk)
             except RuntimeError:
                 self.current_ai_widget = None
                 return
@@ -1103,6 +1141,13 @@ class ChatWindow(QMainWindow):
         if self._request_stale():
             self._request_conversation_id = None
             return
+
+        # 出错也要封存流式段：否则思考卡标题会停在「思考中…」
+        if self.current_ai_widget:
+            try:
+                self.current_ai_widget.seal_stream()
+            except RuntimeError:
+                pass
 
         QMessageBox.critical(self, "API错误", f"请求失败：{error_msg}")
         self.status_label.setText("● 错误")

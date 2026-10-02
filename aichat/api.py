@@ -10,9 +10,11 @@
     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": str}}
     {"type": "tool_use", "id": str, "name": str, "input": dict}
     {"type": "tool_result", "tool_use_id": str, "content": str}
+    {"type": "thinking", "thinking": str, "signature": str}   # 思考块（含签名，原样保留）
 
-流式请求通过 on_text 回调吐出文本增量，返回值携带完整的响应内容块，
-工具调用总是在流结束后以完整形态返回（内部组装），上层无需关心 SSE 细节。
+流式请求通过 on_text / on_thinking 回调分别吐出正文与思考增量，
+返回值携带完整的响应内容块，工具调用总是在流结束后以完整形态返回
+（内部组装），上层无需关心 SSE 细节。
 """
 
 import json
@@ -33,17 +35,40 @@ MAX_TOKENS = 8192
 # 单次请求的读写超时（流式响应按每个 SSE 事件计算）
 STREAM_TIMEOUT = 300
 
+# 思考强度档位（两种格式通用；off 表示不发送思考参数）
+THINKING_OFF = "off"
+THINKING_LOW = "low"
+THINKING_MEDIUM = "medium"
+THINKING_HIGH = "high"
+THINKING_LEVELS = (THINKING_OFF, THINKING_LOW, THINKING_MEDIUM, THINKING_HIGH)
+
+# Anthropic 各档位对应的思考预算（budget_tokens，官方下限 1024）
+ANTHROPIC_BUDGETS = {
+    THINKING_LOW: 2048,
+    THINKING_MEDIUM: 8192,
+    THINKING_HIGH: 16384,
+}
+# 思考 token 计入 max_tokens，官方要求 max_tokens > budget_tokens，
+# 预留 4096 给可见正文
+THINKING_HEADROOM = 4096
+
+
+def normalize_thinking_effort(effort) -> str:
+    """把外部传入的思考强度归一化到合法档位（未知值回退为 off）"""
+    return effort if effort in THINKING_LEVELS else THINKING_OFF
+
 
 class ApiError(Exception):
     """API 请求失败（网络 / HTTP / 协议错误）"""
 
 
-def make_client(fmt: str, api_key: str, base_url: str, model: str):
+def make_client(fmt: str, api_key: str, base_url: str, model: str,
+                thinking_effort: str = THINKING_OFF):
     """按格式创建对应客户端"""
     if fmt == ANTHROPIC:
-        return AnthropicClient(api_key, base_url, model)
+        return AnthropicClient(api_key, base_url, model, thinking_effort)
     if fmt == RESPONSES:
-        return ResponsesClient(api_key, base_url, model)
+        return ResponsesClient(api_key, base_url, model, thinking_effort)
     raise ApiError(f"未知的 API 格式: {fmt}")
 
 
@@ -134,6 +159,9 @@ def message_to_responses_items(msg: dict) -> list:
         btype = block.get("type")
         if btype == "text":
             text_parts.append(block.get("text", ""))
+        elif btype == "thinking":
+            # Responses 的推理状态由服务端管理，历史中的思考块不回传
+            continue
         elif btype == "image":
             src = block.get("source", {})
             data = src.get("data", "")
@@ -180,7 +208,18 @@ def responses_output_to_blocks(items: list) -> list:
     blocks = []
     for item in items or []:
         itype = item.get("type")
-        if itype == "message":
+        if itype == "reasoning":
+            parts = []
+            for part in item.get("summary") or []:
+                if part.get("type") in ("summary_text", "text") and part.get("text"):
+                    parts.append(part["text"])
+            for part in item.get("content") or []:
+                # 少数网关会暴露原始思考文本（reasoning_text）
+                if part.get("type") in ("reasoning_text", "text") and part.get("text"):
+                    parts.append(part["text"])
+            if parts:
+                blocks.append({"type": "thinking", "thinking": "\n\n".join(parts)})
+        elif itype == "message":
             for part in item.get("content") or []:
                 if part.get("type") in ("output_text", "text"):
                     text = part.get("text", "")
@@ -227,21 +266,26 @@ def normalize_history_message(msg: dict) -> dict:
                         "source": {"type": "base64", "media_type": media, "data": data},
                     }
                 )
-        elif itype in ("image", "tool_use", "tool_result"):
+        elif itype in ("image", "tool_use", "tool_result",
+                       "thinking", "redacted_thinking"):
             blocks.append(item)
     return {"role": role, "content": blocks}
 
 
 class _BaseClient:
-    def __init__(self, api_key: str, base_url: str, model: str):
+    def __init__(self, api_key: str, base_url: str, model: str,
+                 thinking_effort: str = THINKING_OFF):
         self.api_key = (api_key or "").strip()
         self.base_url = (base_url or "").strip()
         self.model = (model or "").strip()
+        self.thinking_effort = normalize_thinking_effort(thinking_effort)
 
-    def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None):
+    def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None,
+               on_thinking=None):
         """发起一次流式请求。
 
-        on_text: 文本增量回调 on_text(str)
+        on_text: 正文文本增量回调 on_text(str)
+        on_thinking: 思考过程增量回调 on_thinking(str)（独立于正文，避免污染）
         is_cancelled: 可选的取消检查回调，返回 True 时尽快中止
         返回: {"blocks": [内部内容块], "stop_reason": str}
         """
@@ -263,6 +307,27 @@ class _BaseClient:
         except OSError as e:
             raise ApiError(f"网络错误: {e}") from e
 
+    # 服务端拒绝思考参数的错误特征（模型不支持思考 / max_tokens 超出输出上限）
+    _THINKING_ERROR_KEYWORDS = ("thinking", "reasoning", "budget", "max_tokens", "effort")
+
+    def _thinking_rejected(self, error: ApiError) -> bool:
+        """判断错误是否因思考参数被拒（此时可去掉参数降级重试一次）"""
+        if self.thinking_effort == THINKING_OFF:
+            return False
+        message = str(error).lower()
+        return any(kw in message for kw in self._THINKING_ERROR_KEYWORDS)
+
+    def _open_with_degrade(self, url, build_payload, headers):
+        """建立流连接；思考参数被拒（模型不支持思考 / max_tokens 超上限）时
+        自动去掉思考参数降级重试一次，比让用户手动排查设置更省心"""
+        try:
+            return self._open_stream(url, build_payload(True), headers)
+        except ApiError as e:
+            if self._thinking_rejected(e):
+                print(f"思考参数被服务端拒绝，已自动降级重试: {e}")
+                return self._open_stream(url, build_payload(False), headers)
+            raise
+
     @staticmethod
     def _emit_text(on_text, delta, is_cancelled):
         if on_text and delta and not (is_cancelled and is_cancelled()):
@@ -275,7 +340,23 @@ class AnthropicClient(_BaseClient):
     def endpoint(self) -> str:
         return join_url(self.base_url, "/v1/messages")
 
-    def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None):
+    @staticmethod
+    def _strip_thinking(msg: dict) -> dict:
+        """关闭思考时从历史消息中剥离思考块（Anthropic 会拒绝未开启思考却带思考块的请求）"""
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+                b.get("type") in ("thinking", "redacted_thinking") for b in content):
+            kept = [b for b in content
+                    if b.get("type") not in ("thinking", "redacted_thinking")]
+            if not kept:
+                # 思考阶段即被 max_tokens 截断的回合剥完会剩空 content，
+                # 官方端点拒绝空数组，用占位文本块保住消息结构
+                kept = [{"type": "text", "text": "[thinking omitted]"}]
+            msg = dict(msg)
+            msg["content"] = kept
+        return msg
+
+    def _build_payload(self, messages, system, tools, with_thinking: bool) -> dict:
         payload = {
             "model": self.model,
             "max_tokens": MAX_TOKENS,
@@ -283,16 +364,27 @@ class AnthropicClient(_BaseClient):
             "messages": [dict(m) for m in messages],
             "stream": True,
         }
+        if with_thinking and self.thinking_effort != THINKING_OFF:
+            # 思考 token 计入 max_tokens，需同步抬高上限
+            budget = ANTHROPIC_BUDGETS[self.thinking_effort]
+            payload["max_tokens"] = max(MAX_TOKENS, budget + THINKING_HEADROOM)
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        else:
+            payload["messages"] = [self._strip_thinking(m) for m in messages]
         if tools:
             payload["tools"] = tools
+        return payload
+
+    def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None,
+               on_thinking=None):
         # 官方 Anthropic 用 x-api-key；OpenRouter 等网关用 Bearer Token
         if self.api_key.startswith("sk-or-"):
             auth = {"Authorization": f"Bearer {self.api_key}"}
         else:
             auth = {"x-api-key": self.api_key}
-        resp = self._open_stream(
+        resp = self._open_with_degrade(
             self.endpoint(),
-            payload,
+            lambda with_thinking: self._build_payload(messages, system, tools, with_thinking),
             {**auth, "anthropic-version": "2023-06-01"},
         )
 
@@ -327,6 +419,18 @@ class AnthropicClient(_BaseClient):
                                 blocks_by_index[idx].get("text", "") + text
                             )
                             self._emit_text(on_text, text, is_cancelled)
+                        elif dtype == "thinking_delta":
+                            thinking = delta.get("thinking", "")
+                            blocks_by_index[idx]["thinking"] = (
+                                blocks_by_index[idx].get("thinking", "") + thinking
+                            )
+                            self._emit_text(on_thinking, thinking, is_cancelled)
+                        elif dtype == "signature_delta":
+                            # 签名必须完整保留：agent 回传历史时官方端点会校验
+                            blocks_by_index[idx]["signature"] = (
+                                blocks_by_index[idx].get("signature", "")
+                                + delta.get("signature", "")
+                            )
                         elif dtype == "input_json_delta":
                             json_parts[idx] = json_parts.get(idx, "") + delta.get(
                                 "partial_json", ""
@@ -361,6 +465,8 @@ class AnthropicClient(_BaseClient):
                     block["input"] = {}
             if block.get("type") == "text" and not (block.get("text") or "").strip():
                 continue
+            if block.get("type") == "thinking" and not (block.get("thinking") or "").strip():
+                continue
             blocks.append(block)
         return {"blocks": blocks, "stop_reason": stop_reason}
 
@@ -371,7 +477,7 @@ class ResponsesClient(_BaseClient):
     def endpoint(self) -> str:
         return join_url(self.base_url, "/responses")
 
-    def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None):
+    def _build_payload(self, messages, system, tools, with_thinking: bool) -> dict:
         items = []
         for msg in messages:
             items.extend(message_to_responses_items(msg))
@@ -384,9 +490,15 @@ class ResponsesClient(_BaseClient):
             payload["instructions"] = system
         if tools:
             payload["tools"] = tools_to_responses(tools)
-        resp = self._open_stream(
+        if with_thinking and self.thinking_effort != THINKING_OFF:
+            payload["reasoning"] = {"effort": self.thinking_effort}
+        return payload
+
+    def stream(self, messages, system, tools=None, on_text=None, is_cancelled=None,
+               on_thinking=None):
+        resp = self._open_with_degrade(
             self.endpoint(),
-            payload,
+            lambda with_thinking: self._build_payload(messages, system, tools, with_thinking),
             {"Authorization": f"Bearer {self.api_key}"},
         )
 
@@ -404,6 +516,9 @@ class ResponsesClient(_BaseClient):
                         break
                     if etype == "response.output_text.delta":
                         self._emit_text(on_text, obj.get("delta", ""), is_cancelled)
+                    elif etype in ("response.reasoning_summary_text.delta",
+                                   "response.reasoning_text.delta"):
+                        self._emit_text(on_thinking, obj.get("delta", ""), is_cancelled)
                     elif etype == "response.completed":
                         final_output = (obj.get("response") or {}).get("output")
                     elif etype in ("response.failed", "error"):

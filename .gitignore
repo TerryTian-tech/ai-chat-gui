@@ -1,0 +1,6 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地工具配置
+.claude/
