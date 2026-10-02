@@ -24,10 +24,11 @@ from .agent import AgentWorker
 from .api import (ANTHROPIC, FORMAT_LABELS, RESPONSES, THINKING_HIGH,
                   THINKING_LOW, THINKING_MEDIUM, THINKING_OFF,
                   normalize_history_message, normalize_thinking_effort)
+from . import __version__ as _pkg_version
 from .pet import PuppyWidget
 from .widgets import MessageWidget
 
-APP_VERSION = "V0.5.0"
+APP_VERSION = f"V{_pkg_version}"
 
 
 # ==================== 设置对话框 ====================
@@ -91,9 +92,9 @@ class SettingsDialog(QDialog):
         self.thinking_combo.addItem("高", THINKING_HIGH)
         self.thinking_combo.setToolTip(
             "推理模型的思考预算，同时作用于聊天与 Agent。\n"
-            "Anthropic → thinking.budget_tokens（低 2048 / 中 8192 / 高 16384，\n"
-            "max_tokens 自动抬高）；OpenAI Responses → reasoning.effort。\n"
-            "模型不支持思考或超出输出上限时，会自动去掉思考参数降级重试。")
+            "Anthropic → thinking.budget_tokens（低 2048 / 中 8192 / 高 16384）；\n"
+            "OpenAI Responses → reasoning.effort。\n"
+            "模型不支持思考时自动去掉思考参数重试；输出上限不足时自动收紧 max_tokens。")
         self._style_combo(self.thinking_combo)
         form.addWidget(self.thinking_combo)
 
@@ -851,6 +852,7 @@ class ChatWindow(QMainWindow):
         """取消进行中的请求（停止按钮 / 切换或删除会话时调用）"""
         if self.api_worker is not None:
             worker = self.api_worker
+            cid = self._request_conversation_id
             self.api_worker = None
             if worker.isRunning():
                 worker.stop()
@@ -865,6 +867,10 @@ class ChatWindow(QMainWindow):
                     worker.error_occurred.disconnect()
                 except (RuntimeError, TypeError):
                     pass
+                # 保留最后一次历史回写：被截断的半轮内容也要落盘，
+                # 否则屏幕上已显示的正文/工具卡在重新加载后消失
+                worker.history_ready.connect(
+                    lambda msgs, cid=cid: self._on_cancelled_history(cid, msgs))
                 # stop() 只是异步置位，线程此刻往往仍阻塞在流读取/退避等待中；
                 # 直接丢引用会销毁运行中的 QThread（qFatal 杀进程）。
                 # 暂存到回收列表，等 finished 后再释放。
@@ -874,7 +880,7 @@ class ChatWindow(QMainWindow):
                     lambda w=worker: self._retiring_workers.remove(w)
                     if w in self._retiring_workers else None)
 
-        # 模态确认框还开着的话关掉（用户已放弃请求，视为拒绝）
+        # 确认框还开着的话关掉（用户已放弃请求，视为拒绝）
         if self._confirm_box is not None:
             try:
                 self._confirm_box.reject()
@@ -885,6 +891,7 @@ class ChatWindow(QMainWindow):
         if self.current_ai_widget:
             try:
                 self.current_ai_widget.seal_stream()
+                self.current_ai_widget.mark_interrupted()
             except RuntimeError:
                 pass
 
@@ -895,6 +902,12 @@ class ChatWindow(QMainWindow):
         self.status_label.setText("● 就绪")
         self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
         self._set_requesting_state(False)
+
+    def _on_cancelled_history(self, cid, messages):
+        """取消后 worker 的最后回写：把已生成的半轮内容落盘到原会话"""
+        if cid and cid in self.conversations:
+            self.conversations[cid]['messages'] = messages
+            self.save_conversations()
 
     def create_new_conversation(self):
         self._cancel_current_request()
@@ -969,7 +982,7 @@ class ChatWindow(QMainWindow):
                 item.widget().deleteLater()
 
     def add_message_widget(self, role: str, content, image_data_list=None) -> MessageWidget:
-        stretch_item = self.messages_layout.takeAt(self.messages_layout.count() - 1)
+        self.messages_layout.takeAt(self.messages_layout.count() - 1)  # 摘除尾部 stretch
         msg_widget = MessageWidget(role, content, image_data_list)
         self.messages_layout.addWidget(msg_widget)
         self.messages_layout.addStretch()
@@ -996,6 +1009,10 @@ class ChatWindow(QMainWindow):
     # ---------- 发送与 agent 回合 ----------
 
     def send_message(self):
+        # 请求进行中拒绝再次发送（Enter 键也走这里）：
+        # 否则会覆盖 api_worker 引用，产生无人回收的野生线程 + 历史串写
+        if self._request_active:
+            return
         user_text = self.input_edit.toPlainText().strip()
         has_images = bool(self.current_image_data_list)
 
@@ -1160,7 +1177,7 @@ class ChatWindow(QMainWindow):
         self.scroll_to_bottom()
 
     def on_confirm_requested(self, name: str, args_display: str, approver):
-        """GUI 线程弹窗确认危险工具（工作线程阻塞等待）"""
+        """GUI 线程弹出工具确认（非模态：等待期间仍可点「⏹ 停止」整体取消）"""
         preview = args_display if len(args_display) <= 800 else args_display[:800] + "…"
         box = QMessageBox(
             QMessageBox.Icon.Question, "确认执行工具",
@@ -1169,11 +1186,35 @@ class ChatWindow(QMainWindow):
             self,
         )
         box.setDefaultButton(QMessageBox.StandardButton.No)
+        # QMessageBox 默认 ApplicationModal，会挡住主窗口的「⏹ 停止」；
+        # 显式改为 NonModal：等待确认期间仍可停止生成/切换会话
+        box.setWindowModality(Qt.NonModal)
+        decided = []
+
+        def decide_once(ok: bool):
+            if not decided:
+                decided.append(ok)
+                approver.decide(ok)
+
+        def on_finished(_result):
+            # ESC / 关闭 / 停止取消等路径：尚未决定则一律按拒绝处理
+            decide_once(False)
+            if self._confirm_box is box:
+                self._confirm_box = None
+
+        # 注意：不能连按钮的 clicked——QMessageBox 内部先于自定义槽触发
+        # accept()/reject()，会导致 finished 的兜底拒绝抢占 decided 名额；
+        # accepted/rejected 语义正好覆盖"是/否/ESC/关闭"全部路径
+        box.accepted.connect(lambda: decide_once(True))
+        box.rejected.connect(lambda: decide_once(False))
+
+        def on_finished(_result):
+            if self._confirm_box is box:
+                self._confirm_box = None
+
+        box.finished.connect(on_finished)
         self._confirm_box = box
-        reply = box.exec()
-        if self._confirm_box is box:
-            self._confirm_box = None
-        approver.decide(reply == QMessageBox.StandardButton.Yes)
+        box.show()
 
     def on_history_ready(self, messages):
         cid = self._request_conversation_id

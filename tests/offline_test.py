@@ -308,6 +308,251 @@ def test_stop_generation():
         shutil.rmtree(hist_dir, ignore_errors=True)
 
 
+def test_empty_blocks_guard():
+    print("\n[3.12] 空响应不写入空 content（防下一轮 400）")
+    import urllib.request
+    from aichat.agent import AgentWorker
+
+    events = [
+        "event: message_start",
+        'data: {"type":"message_start","message":{"id":"m","role":"assistant","content":[]}}',
+        "",
+        "event: content_block_start",
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        "",
+        "event: content_block_delta",
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"   "}}',
+        "",
+        "event: content_block_stop",
+        'data: {"type":"content_block_stop","index":0}',
+        "",
+        "event: message_delta",
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        "",
+    ]
+
+    class FakeResp:
+        def __init__(self, lines):
+            self._lines = [l.encode() for l in lines]
+        def __iter__(self):
+            return iter(self._lines)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=None: FakeResp(events)
+    try:
+        worker = AgentWorker(messages=[{"role": "user", "content": "hi"}],
+                             fmt="anthropic", api_key="k", base_url="http://x", model="m")
+        history = []
+        worker.history_ready.connect(lambda h: history.append(h))
+        worker.run()
+    finally:
+        urllib.request.urlopen = orig
+    h = history[0]
+    check("空响应: 历史不含空 assistant 消息",
+          len(h) == 1 and h[0]["role"] == "user", str(h))
+
+
+def test_sse_flush():
+    print("\n[3.13] SSE 末尾无空行结尾时不丢事件")
+    import urllib.request
+    from aichat.api import AnthropicClient
+
+    events = [
+        "event: message_start",
+        'data: {"type":"message_start","message":{"id":"m","role":"assistant","content":[]}}',
+        "",
+        "event: content_block_start",
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        "",
+        "event: content_block_delta",
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"结尾"}}',
+        "",
+        "event: content_block_stop",
+        'data: {"type":"content_block_stop","index":0}',
+        "",
+        "event: message_delta",
+        # 以下 data 行之后没有空行，流直接结束——此前该事件会被丢弃
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+    ]
+
+    class FakeResp:
+        def __init__(self, lines):
+            self._lines = [l.encode() for l in lines]
+        def __iter__(self):
+            return iter(self._lines)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = lambda req, timeout=None: FakeResp(events)
+    try:
+        result = AnthropicClient("k", "http://x", "m").stream(
+            [{"role": "user", "content": "hi"}], "s")
+    finally:
+        urllib.request.urlopen = orig
+    check("SSE: 无空行结尾的末尾事件被保留",
+          result["blocks"][0]["text"] == "结尾" and result["stop_reason"] == "end_turn",
+          str(result))
+
+
+def test_interruptible_backoff():
+    print("\n[3.14] 退避等待可被取消打断（Retry-After: 30 不再卡死）")
+    import threading as _threading
+    import time as _time
+    from aichat.api import AnthropicClient, ApiError
+
+    class Retry30Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        calls = []
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            type(self).calls.append(self.path)
+            if len(type(self).calls) == 1:
+                payload = b'{"error":{"message":"rate limited"}}'
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "30")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            sse = anth_events([("text", "ok")])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            data = sse.encode("utf-8")
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Retry30Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        cancel_event = _threading.Event()
+        outcome = {}
+
+        def run():
+            try:
+                AnthropicClient("k", f"http://127.0.0.1:{server.server_address[1]}", "m").stream(
+                    [{"role": "user", "content": "hi"}], "s",
+                    is_cancelled=cancel_event.is_set)
+                outcome["ok"] = True
+            except ApiError as e:
+                outcome["err"] = str(e)
+
+        t0 = _time.time()
+        thread = _threading.Thread(target=run, daemon=True)
+        thread.start()
+        _time.sleep(0.5)  # 此刻 worker 正处于 30s 的退避等待中
+        cancel_event.set()
+        thread.join(5)
+        elapsed = _time.time() - t0
+        check("退避: 取消后快速退出（不再等满 30s）",
+              not thread.is_alive() and elapsed < 5 and "取消" in outcome.get("err", ""),
+              f"elapsed={elapsed:.1f}s err={outcome.get('err')}")
+    finally:
+        server.shutdown()
+
+
+def test_interrupted_half_round():
+    print("\n[3.15] 停止生成时半轮内容落盘")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from aichat.window import ChatWindow
+
+    class PartialStreamHandler(BaseHTTPRequestHandler):
+        """先吐一段文本增量，停顿 1.5s 再发剩余——模拟"停止时正在流式输出\""""
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            part1 = "\r\n".join([
+                "event: message_start",
+                'data: {"type":"message_start","message":{"id":"m","role":"assistant","content":[]}}',
+                "",
+                "event: content_block_start",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                "event: content_block_delta",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半轮内容"}}',
+                "",
+            ]) + "\r\n"
+            piece = part1.encode("utf-8")
+            self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+            self.wfile.flush()
+            time.sleep(1.5)
+            part2 = "\r\n".join([
+                "event: content_block_stop",
+                'data: {"type":"content_block_stop","index":0}',
+                "",
+                "event: message_delta",
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+                "",
+                "event: message_stop",
+                'data: {"type":"message_stop"}',
+                "",
+            ])
+            piece = part2.encode("utf-8")
+            self.wfile.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PartialStreamHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    hist_dir = tempfile.mkdtemp(prefix="aichat_hist3_")
+    ChatWindow.HISTORY_DIR = hist_dir
+    ChatWindow.HISTORY_FILE = os.path.join(hist_dir, "conversations.json")
+    win = ChatWindow()
+    try:
+        win.api_format, win.api_key = "anthropic", "sk-test"
+        win.base_url, win.model = f"http://127.0.0.1:{server.server_address[1]}", "m"
+        win.thinking_effort = "off"
+        win.input_edit.setPlainText("讲个故事")
+        win.send_message()
+        time.sleep(0.5)  # part1 已被消费：气泡正在显示"半轮内容"
+        win._stop_generation()
+        worker = win._retiring_workers[0]
+        check("停止: worker 线程自然结束", worker.wait(8000))
+        for _ in range(100):
+            app.processEvents()
+            if not win._retiring_workers:
+                break
+            time.sleep(0.05)
+        msgs = win.conversations[win.current_conversation_id]['messages']
+        partial = (len(msgs) == 2 and isinstance(msgs[-1].get("content"), list)
+                   and any(b.get("type") == "text" and "半轮内容" in b.get("text", "")
+                           for b in msgs[-1]["content"]))
+        check("停止: 半轮正文已落盘到会话历史", partial, str(msgs)[:200])
+    finally:
+        win.process_monitor.stop()
+        win.process_monitor.wait(2000)
+        server.shutdown()
+        shutil.rmtree(hist_dir, ignore_errors=True)
+
+
 def test_api_clients(base):
     print("\n[1] API 客户端直连（双格式流式 + 工具调用组装）")
     from aichat.api import AnthropicClient, ResponsesClient, ApiError
@@ -432,13 +677,14 @@ class ErrHandler(BaseHTTPRequestHandler):
 class FailFirstHandler(BaseHTTPRequestHandler):
     """前 fail_count 次请求返回 error_code（消息可配置），之后返回正常 SSE。
 
-    用于验证：思考参数被拒时自动降级重试一次；429/5xx 连接阶段指数退避重试。
+    用于验证：思考参数被拒时自动降级重试；max_tokens 超限时按服务端上报的
+    上限收紧重试；429/5xx 连接阶段指数退避重试。
     """
     protocol_version = "HTTP/1.1"
     calls = []  # [(path, body)]
     error_code = 400
-    error_message = ("max_tokens: 20480 > 8192, which is the maximum allowed number "
-                     "of output tokens; thinking is not supported by this model")
+    error_messages = []  # 按失败次序取用的消息，超出后回落到 error_message
+    error_message = "thinking is not supported by this model"
     fail_count = 1
 
     def log_message(self, *args):
@@ -449,7 +695,10 @@ class FailFirstHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         type(self).calls.append((self.path, body))
         if len(type(self).calls) <= type(self).fail_count:
-            payload = json.dumps({"error": {"message": type(self).error_message}}).encode()
+            idx = len(type(self).calls) - 1
+            msgs = type(self).error_messages
+            msg = msgs[idx] if idx < len(msgs) else type(self).error_message
+            payload = json.dumps({"error": {"message": msg}}).encode()
             self.send_response(type(self).error_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -593,14 +842,15 @@ def test_thinking_support(base):
                             message_to_responses_items)
 
     # --- Anthropic：开启 → payload 注入 thinking + max_tokens 抬高 ---
+    from aichat.api import MAX_TOKENS
     AnthropicClient("sk-test", base, "test-model", "medium").stream(
         [{"role": "user", "content": "hi"}], "s")
     req = RECEIVED[-1]
     check("anthropic: thinking 参数按档位注入",
           req["body"]["thinking"] == {"type": "enabled", "budget_tokens": 8192},
           str(req["body"].get("thinking")))
-    check("anthropic: max_tokens 抬到 budget+4096",
-          req["body"]["max_tokens"] == 12288, str(req["body"]["max_tokens"]))
+    check("anthropic: max_tokens 取默认上限与预算余量的较大者",
+          req["body"]["max_tokens"] == MAX_TOKENS, str(req["body"]["max_tokens"]))
 
     # --- Anthropic：关闭 → 不注入，且历史思考块被剥离 ---
     AnthropicClient("sk-test", base, "test-model", "off").stream(
@@ -631,8 +881,9 @@ def test_thinking_support(base):
         check("anthropic: 思考块排最前且签名完整",
               tb["type"] == "thinking" and tb["thinking"] == "我先想一下……"
               and tb["signature"] == "sigSIGsig", str(tb))
-        check("anthropic: 高档位 max_tokens=20480",
-              RECEIVED[-1]["body"]["max_tokens"] == 20480, str(RECEIVED[-1]["body"]["max_tokens"]))
+        check("anthropic: 高档位 max_tokens 保持默认上限",
+              RECEIVED[-1]["body"]["max_tokens"] == MAX_TOKENS,
+              str(RECEIVED[-1]["body"]["max_tokens"]))
 
         # --- Responses：reasoning.effort + 摘要增量 + reasoning item 转换 ---
         thinks2 = []
@@ -714,9 +965,9 @@ def test_thinking_degrade():
             [{"role": "user", "content": "hi"}], "s", on_text=texts.append)
         _, first = FailFirstHandler.calls[0]
         _, second = FailFirstHandler.calls[1]
-        check("anthropic: 首请求带 thinking + 抬高的 max_tokens",
+        check("anthropic: 首请求带 thinking + 默认 max_tokens 上限",
               first.get("thinking") == {"type": "enabled", "budget_tokens": 16384}
-              and first["max_tokens"] == 20480,
+              and first["max_tokens"] == MAX_TOKENS,
               f"{first.get('thinking')} / {first['max_tokens']}")
         check("anthropic: 重试请求已去 thinking 且 max_tokens 复位",
               "thinking" not in second and second["max_tokens"] == MAX_TOKENS,
@@ -770,9 +1021,7 @@ def test_thinking_degrade():
         check("anthropic: 思考截断历史 → 占位文本块而非空 content",
               a_content == [{"type": "text", "text": "[thinking omitted]"}], str(a_content))
     finally:
-        FailFirstHandler.error_message = ("max_tokens: 20480 > 8192, which is the maximum "
-                                          "allowed number of output tokens; thinking is not "
-                                          "supported by this model")
+        FailFirstHandler.error_message = "thinking is not supported by this model"
         FailFirstHandler.fail_count = 1
         server.shutdown()
 
@@ -863,9 +1112,76 @@ def test_retry_backoff():
                   f"{len(FailFirstHandler.calls)} / {e}")
     finally:
         FailFirstHandler.error_code = 400
-        FailFirstHandler.error_message = ("max_tokens: 20480 > 8192, which is the maximum "
-                                          "allowed number of output tokens; thinking is not "
-                                          "supported by this model")
+        FailFirstHandler.error_message = "thinking is not supported by this model"
+        FailFirstHandler.fail_count = 1
+        server.shutdown()
+
+
+def test_output_limit_clamp():
+    print("\n[3.7b] max_tokens 超限自动收紧（按服务端上报的上限重试）")
+    from aichat.api import AnthropicClient, ApiError
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FailFirstHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        # 上限装得下思考预算：收紧 max_tokens、保留思考参数
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_messages = [
+            "max_tokens: 393216 > 64000, which is the maximum allowed number of output tokens"]
+        FailFirstHandler.fail_count = 1
+        texts = []
+        AnthropicClient("k", base, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s", on_text=texts.append)
+        _, second = FailFirstHandler.calls[1]
+        check("anthropic: 超限后按服务端上限收紧并保留思考",
+              len(FailFirstHandler.calls) == 2 and second["max_tokens"] == 64000
+              and second.get("thinking") == {"type": "enabled", "budget_tokens": 16384}
+              and "".join(texts) == "降级成功",
+              f"{second['max_tokens']} / {second.get('thinking')}")
+
+        # 上限装不下思考预算（高档 budget+4096=20480 > 20000）：连思考一起去掉
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_messages = [
+            "max_tokens: 393216 > 20000, which is the maximum allowed number of output tokens"]
+        FailFirstHandler.fail_count = 1
+        AnthropicClient("k", base, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s")
+        _, second = FailFirstHandler.calls[1]
+        check("anthropic: 上限装不下思考预算时连思考一起去掉",
+              "thinking" not in second and second["max_tokens"] == 20000,
+              f"{second['max_tokens']} / {second.get('thinking')}")
+
+        # 两段式：先超限、收紧后思考仍被拒 → 再去掉思考
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_messages = [
+            "max_tokens: 393216 > 64000, which is the maximum allowed number of output tokens",
+            "thinking is not supported by this model",
+        ]
+        FailFirstHandler.fail_count = 2
+        AnthropicClient("k", base, "m", "high").stream(
+            [{"role": "user", "content": "hi"}], "s")
+        _, second = FailFirstHandler.calls[1]
+        _, third = FailFirstHandler.calls[2]
+        check("anthropic: 收紧上限与思考降级可串联",
+              len(FailFirstHandler.calls) == 3
+              and second["max_tokens"] == 64000 and "thinking" in second
+              and third["max_tokens"] == 64000 and "thinking" not in third,
+              str([(b.get("max_tokens"), b.get("thinking")) for _, b in FailFirstHandler.calls]))
+
+        # 与 max_tokens 无关的 400 不触发收紧
+        FailFirstHandler.calls.clear()
+        FailFirstHandler.error_messages = ["invalid x-api-key"]
+        FailFirstHandler.fail_count = 1
+        try:
+            AnthropicClient("k", base, "m", "high").stream(
+                [{"role": "user", "content": "hi"}], "s")
+            check("anthropic: 无关 400 不触发收紧重试", False)
+        except ApiError as e:
+            check("anthropic: 无关 400 不触发收紧重试",
+                  len(FailFirstHandler.calls) == 1 and "invalid" in str(e), str(e))
+    finally:
+        FailFirstHandler.error_messages = []
         FailFirstHandler.fail_count = 1
         server.shutdown()
 
@@ -877,6 +1193,11 @@ def test_context_window():
 
     small = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     check("窗口: 预算内历史原样返回", window_messages(small) == small)
+
+    # 默认预算按 1M 上下文档校准（80 万字符）：中等规模历史不应被裁
+    medium = [{"role": "user", "content": "字" * 100_000},
+              {"role": "assistant", "content": "字" * 100_000}]
+    check("窗口: 默认 1M 档预算不裁 20 万字符历史", window_messages(medium) == medium)
 
     orig_limit = api_mod.CONTEXT_CHAR_LIMIT
     try:
@@ -894,6 +1215,18 @@ def test_context_window():
               and windowed[2]["content"].startswith("问题3")
               and windowed[3]["content"].startswith("回答3"),
               str([m["content"][:6] for m in windowed]))
+
+        # 回归：thinking=off（默认档）此前在 else 分支用未裁剪全量覆盖了裁剪结果
+        from aichat.api import AnthropicClient
+        payload_off = AnthropicClient("k", "http://x", "m", "off")._build_payload(
+            msgs, "s", None, True)
+        check("窗口: thinking=off 同样走裁剪",
+              len(payload_off["messages"]) == len(windowed),
+              f"payload={len(payload_off['messages'])} windowed={len(windowed)}")
+        payload_high = AnthropicClient("k", "http://x", "m", "high")._build_payload(
+            msgs, "s", None, True)
+        check("窗口: thinking=high 裁剪不回退",
+              len(payload_high["messages"]) == len(windowed))
         est = sum(estimate_message_chars(m) for m in windowed)
         check("窗口: 裁剪后估算量下降", est < sum(estimate_message_chars(m) for m in msgs))
 
@@ -1212,6 +1545,70 @@ def test_ui(workdir):
     check("停止按钮: 停止后恢复发送态",
           win.send_btn.text() == "发送" and not win._request_active, win.send_btn.text())
 
+    # 生成中再次发送被守卫拒绝（Enter 直呼 send_message 的回归：
+    # 此前会产生无人回收的野生 worker 线程）
+    win._request_active = True
+    win.input_edit.setPlainText("并发测试")
+    win.send_message()
+    check("并发守卫: 请求进行中 send_message 不创建新 worker",
+          win.api_worker is None and win._request_active)
+    win._request_active = False
+    win.input_edit.clear()
+
+    # 工具确认弹窗：非模态、可 ESC/停止取消、防重复决定
+    from PySide6.QtWidgets import QMessageBox as _QMessageBox
+    from aichat.agent import AgentWorker, ToolApprover
+    appr = ToolApprover()
+    win.on_confirm_requested("bash", '{"cmd": "echo hi"}', appr)
+    box = win._confirm_box
+    check("确认弹窗: 非模态弹出且线程仍等待",
+          box is not None and not box.isModal() and box.isVisible()
+          and not appr._event.is_set())
+    box.button(_QMessageBox.StandardButton.No).click()
+    for _ in range(30):
+        app.processEvents()
+        if win._confirm_box is None:
+            break
+        time.sleep(0.02)
+    check("确认弹窗: 点击否 → 拒绝并回收",
+          appr.approved is False and appr._event.is_set() and win._confirm_box is None)
+    appr2 = ToolApprover()
+    win.on_confirm_requested("bash", "{}", appr2)
+    win._confirm_box.button(_QMessageBox.StandardButton.Yes).click()
+    for _ in range(30):
+        app.processEvents()
+        if win._confirm_box is None:
+            break
+        time.sleep(0.02)
+    check("确认弹窗: 点击是 → 批准且 decided 不被 finished 覆盖",
+          appr2.approved is True and appr2._event.is_set())
+
+    # 版本号单一来源（__init__.__version__ → APP_VERSION）
+    from aichat import __version__
+    from aichat.window import APP_VERSION
+    check("版本号: 单一来源拼接", APP_VERSION == f"V{__version__}",
+          f"{APP_VERSION} vs {__version__}")
+
+    # 中断标记：停止生成后气泡追加提示段（seal 会把流式段换成正式渲染段，
+    # 故浏览器数量 +2：正文一段 + 标记一段）
+    wm = win.add_message_widget("assistant", "")
+    wm.stream_append("写到一半")
+    n_before = len(wm._all_text_browsers)
+    wm.mark_interrupted()
+    check("中断标记: 气泡末尾追加提示段",
+          len(wm._all_text_browsers) == n_before + 2
+          and "已中断" in wm._all_text_browsers[-1].toPlainText(),
+          str([b.toPlainText() for b in wm._all_text_browsers]))
+
+    # 桌宠隐藏时暂停 30fps 动画定时器，显示时恢复
+    pw = win.puppy_widget
+    pw.show()
+    pw.hide()
+    check("桌宠: 隐藏时暂停动画定时器", not pw._timer.isActive())
+    pw.show()
+    check("桌宠: 显示时恢复动画定时器", pw._timer.isActive())
+    pw.hide()
+
     # 错误气泡移除判定：有工具卡片/思考卡的气泡不算空
     we = win.add_message_widget("assistant", "")
     check("is_empty: 空气泡为空", we.is_empty())
@@ -1244,6 +1641,7 @@ def test_ui(workdir):
         win.puppy_widget.repaint()
     check("小狗十种姿态渲染无崩溃", True)
     pw = win.puppy_widget
+    pw._run_flags.clear()   # 进程监控可能在本机检测到浏览器而触发奔跑，清掉保证确定性
     for state in ("thinking", "working", "happy", "sad", "idle"):
         pw.set_ai_state(state)
         pw.repaint()
@@ -1291,6 +1689,10 @@ def main():
     try:
         test_ui(workdir)          # 先建 QApplication，供后续 QThread 使用
         test_stop_generation()
+        test_interrupted_half_round()
+        test_empty_blocks_guard()
+        test_sse_flush()
+        test_interruptible_backoff()
         test_api_clients(base)
         test_api_block_start_input()
         test_agent_worker(base, workdir)
@@ -1298,6 +1700,7 @@ def main():
         test_thinking_degrade()
         test_error_history_writeback()
         test_retry_backoff()
+        test_output_limit_clamp()
         test_context_window()
         test_encoding_tools(workdir)
         test_responses_done_fallback()

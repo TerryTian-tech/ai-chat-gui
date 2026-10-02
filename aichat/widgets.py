@@ -895,6 +895,14 @@ class MessageWidget(QFrame):
         if widget:
             widget.set_result(result_text, ok)
 
+    def mark_interrupted(self):
+        """停止生成后在气泡末尾追加中断标记（UI 提示，不写入历史）"""
+        try:
+            self.seal_stream()
+            self._add_text_segment(self.text_layout, "— 已中断 —", user=False)
+        except RuntimeError:
+            pass
+
     # ----- 图片 -----
 
     def add_multiple_image_widgets(self, layout: QVBoxLayout):

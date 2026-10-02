@@ -644,6 +644,16 @@ class PuppyWidget(QWidget):
 
     # ---------- 交互 ----------
 
+    def hideEvent(self, event):
+        # 隐藏时暂停 30fps 动画时钟，避免不可见时持续空转重绘
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(33)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_active = True

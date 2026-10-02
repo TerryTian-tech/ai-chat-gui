@@ -18,6 +18,7 @@
 """
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -31,8 +32,10 @@ FORMAT_LABELS = {
     RESPONSES: "OpenAI (Responses)",
 }
 
-# Anthropic 官方要求 max_tokens 必填
-MAX_TOKENS = 8192
+# Anthropic 官方要求 max_tokens 必填；384K 对齐 1M 上下文档模型的最大输出。
+# 输出上限较小的模型会因此报 400，由 _open_with_degrade 按服务端上报的
+# 上限自动收紧重试，对用户无感
+MAX_TOKENS = 384 * 1024
 # 单次请求的读写超时（流式响应按每个 SSE 事件计算）
 STREAM_TIMEOUT = 300
 
@@ -58,8 +61,11 @@ _RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 _MAX_OPEN_ATTEMPTS = 3
 
 # 请求携带的历史字符预算（粗略估算，超出的旧轮次不随请求发送）。
+# 按 1M token 上下文的模型校准：中文最坏情况约 1 字符 ≈ 1 token，
+# 80 万字符 ≈ 80 万 token，加上输出与估算误差仍留有约 20% 余量；
+# 英文场景字符数远高于 token 数，实际余量更大。
 # 只裁剪请求，不动本地历史存档；按完整轮次边界裁剪，保证 tool_use/tool_result 配对完整
-CONTEXT_CHAR_LIMIT = 120_000
+CONTEXT_CHAR_LIMIT = 800_000
 
 
 def _retry_delay(http_error, default_delay: float) -> float:
@@ -69,6 +75,26 @@ def _retry_delay(http_error, default_delay: float) -> float:
     except (TypeError, ValueError):
         wait = default_delay
     return min(max(wait, 1.0), 30.0)
+
+
+def _parse_output_cap(error, sent_limit):
+    """从 400 错误消息中解析服务端允许的最大输出 token 数。
+
+    仅当消息明确指向 max_tokens 超限（含上限数值、且小于我方发送值）时
+    返回该上限，否则返回 None（不是超限错误，不触发收紧重试）。
+    Anthropic 形如 "max_tokens: 393216 > 64000, ..."，网关多为
+    "Maximum allowed is 64000" 一类。"""
+    message = str(error)
+    if "max_tokens" not in message.lower() or sent_limit is None:
+        return None
+    match = (re.search(r">\s*(\d+)", message)
+             or re.search(r"maximum[^\d]*(\d+)", message, re.IGNORECASE))
+    if not match:
+        return None
+    cap = int(match.group(1))
+    if cap <= 0 or cap >= sent_limit:
+        return None
+    return cap
 
 
 def estimate_message_chars(msg: dict) -> int:
@@ -218,6 +244,10 @@ def _iter_sse(resp):
             if payload == "[DONE]":
                 return
             data_lines.append(payload)
+    # 流结束（或 [DONE] 前直接断开）时冲刷残留缓冲：
+    # 部分网关的末尾事件不带空行结尾，不冲刷会丢事件
+    if data_lines:
+        yield event_name, "\n".join(data_lines)
 
 
 def tools_to_responses(tools):
@@ -399,7 +429,19 @@ class _BaseClient:
         """
         raise NotImplementedError
 
-    def _open_stream(self, url, payload, headers):
+    def _interruptible_sleep(self, seconds: float, is_cancelled):
+        """可被取消打断的退避等待（100ms 粒度轮询取消标志，替代不可中断的 sleep）"""
+        if is_cancelled is None:
+            time.sleep(seconds)
+            return
+        deadline = time.time() + seconds
+        while not is_cancelled():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.1, remaining))
+
+    def _open_stream(self, url, payload, headers, is_cancelled=None):
         req = urllib.request.Request(
             url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -410,25 +452,27 @@ class _BaseClient:
         # 此时重试不会产生重复输出；流中途失败无法安全续传，仍直接抛出
         delay = 1.0
         for attempt in range(_MAX_OPEN_ATTEMPTS):
+            if is_cancelled is not None and is_cancelled():
+                raise ApiError("已取消")
             try:
                 return urllib.request.urlopen(req, timeout=STREAM_TIMEOUT)
             except urllib.error.HTTPError as e:
                 if e.code in _RETRYABLE_HTTP_CODES and attempt < _MAX_OPEN_ATTEMPTS - 1:
                     wait = _retry_delay(e, delay)
                     print(f"请求失败（HTTP {e.code}），{wait:.0f}s 后重试: {url}")
-                    time.sleep(wait)
+                    self._interruptible_sleep(wait, is_cancelled)
                     delay *= 2
                     continue
                 raise ApiError(_http_error_message(e)) from e
             except urllib.error.URLError as e:
                 if attempt < _MAX_OPEN_ATTEMPTS - 1:
-                    time.sleep(delay)
+                    self._interruptible_sleep(delay, is_cancelled)
                     delay *= 2
                     continue
                 raise ApiError(f"连接失败: {e.reason}") from e
             except OSError as e:
                 if attempt < _MAX_OPEN_ATTEMPTS - 1:
-                    time.sleep(delay)
+                    self._interruptible_sleep(delay, is_cancelled)
                     delay *= 2
                     continue
                 raise ApiError(f"网络错误: {e}") from e
@@ -443,16 +487,33 @@ class _BaseClient:
         message = str(error).lower()
         return any(kw in message for kw in self._THINKING_ERROR_KEYWORDS)
 
-    def _open_with_degrade(self, url, build_payload, headers):
-        """建立流连接；思考参数被拒（模型不支持思考 / max_tokens 超上限）时
-        自动去掉思考参数降级重试一次，比让用户手动排查设置更省心"""
-        try:
-            return self._open_stream(url, build_payload(True), headers)
-        except ApiError as e:
-            if self._thinking_rejected(e):
-                print(f"思考参数被服务端拒绝，已自动降级重试: {e}")
-                return self._open_stream(url, build_payload(False), headers)
-            raise
+    def _open_with_degrade(self, url, build_payload, headers, is_cancelled=None):
+        """建立流连接；服务端拒绝思考参数或输出超限时自动修正后重试。
+
+        最多修正两次，且可串联：max_tokens 超限 → 按服务端上报的上限收紧；
+        思考参数被拒 → 去掉思考参数。例如"先收紧上限、再去掉思考参数"。"""
+        with_thinking = True
+        output_limit = None
+        for _ in range(3):
+            payload = build_payload(with_thinking, output_limit)
+            try:
+                return self._open_stream(url, payload, headers, is_cancelled)
+            except ApiError as e:
+                cap = _parse_output_cap(e, payload.get("max_tokens"))
+                if cap is not None:
+                    if cap == output_limit:
+                        raise  # 已按该上限重试过仍报超限
+                    print(f"max_tokens 超出模型输出上限，按 {cap} 收紧重试: {e}")
+                    output_limit = cap
+                    continue
+                if self._thinking_rejected(e):
+                    if not with_thinking:
+                        raise  # 已去掉思考参数仍被拒
+                    print(f"思考参数被服务端拒绝，已自动降级重试: {e}")
+                    with_thinking = False
+                    continue
+                raise
+        raise ApiError("请求参数自动修正重试次数耗尽")
 
     @staticmethod
     def _emit_text(on_text, delta, is_cancelled):
@@ -482,21 +543,36 @@ class AnthropicClient(_BaseClient):
             msg["content"] = kept
         return msg
 
-    def _build_payload(self, messages, system, tools, with_thinking: bool) -> dict:
+    def _build_payload(self, messages, system, tools, with_thinking,
+                       output_limit=None):
+        max_tokens = MAX_TOKENS
+        thinking_on = with_thinking and self.thinking_effort != THINKING_OFF
+        if thinking_on:
+            # 思考 token 计入 max_tokens，需同步抬高上限
+            max_tokens = max(max_tokens,
+                             ANTHROPIC_BUDGETS[self.thinking_effort] + THINKING_HEADROOM)
+        if output_limit is not None and output_limit < max_tokens:
+            max_tokens = output_limit
+            # 上限装不下思考预算（max_tokens 必须大于 budget_tokens）时连思考一起去掉
+            if thinking_on and output_limit < (
+                    ANTHROPIC_BUDGETS[self.thinking_effort] + THINKING_HEADROOM):
+                thinking_on = False
+        # 上下文窗口裁剪对两个分支都生效（此前 else 分支用全量覆盖导致默认档失效）
+        windowed = [dict(m) for m in window_messages(messages)]
         payload = {
             "model": self.model,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": max_tokens,
             "system": system or "",
-            "messages": [dict(m) for m in window_messages(messages)],
+            "messages": windowed,
             "stream": True,
         }
-        if with_thinking and self.thinking_effort != THINKING_OFF:
-            # 思考 token 计入 max_tokens，需同步抬高上限
-            budget = ANTHROPIC_BUDGETS[self.thinking_effort]
-            payload["max_tokens"] = max(MAX_TOKENS, budget + THINKING_HEADROOM)
-            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        if thinking_on:
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": ANTHROPIC_BUDGETS[self.thinking_effort],
+            }
         else:
-            payload["messages"] = [self._strip_thinking(m) for m in messages]
+            payload["messages"] = [self._strip_thinking(m) for m in windowed]
         if tools:
             payload["tools"] = tools
         return payload
@@ -510,8 +586,10 @@ class AnthropicClient(_BaseClient):
             auth = {"x-api-key": self.api_key}
         resp = self._open_with_degrade(
             self.endpoint(),
-            lambda with_thinking: self._build_payload(messages, system, tools, with_thinking),
+            lambda with_thinking, output_limit=None: self._build_payload(
+                messages, system, tools, with_thinking, output_limit),
             {**auth, "anthropic-version": "2023-06-01"},
+            is_cancelled,
         )
 
         blocks_by_index = {}
@@ -603,7 +681,10 @@ class ResponsesClient(_BaseClient):
     def endpoint(self) -> str:
         return join_url(self.base_url, "/responses")
 
-    def _build_payload(self, messages, system, tools, with_thinking: bool) -> dict:
+    def _build_payload(self, messages, system, tools, with_thinking,
+                       output_limit=None):
+        # output_limit 仅用于 Anthropic 侧的输出上限收紧；Responses 不发送
+        # 输出上限参数（由服务端取模型默认值），此参数仅为签名兼容而保留
         items = []
         for msg in window_messages(messages):
             items.extend(message_to_responses_items(msg))
@@ -624,8 +705,10 @@ class ResponsesClient(_BaseClient):
                on_thinking=None):
         resp = self._open_with_degrade(
             self.endpoint(),
-            lambda with_thinking: self._build_payload(messages, system, tools, with_thinking),
+            lambda with_thinking, output_limit=None: self._build_payload(
+                messages, system, tools, with_thinking, output_limit),
             {"Authorization": f"Bearer {self.api_key}"},
+            is_cancelled,
         )
 
         final_output = None

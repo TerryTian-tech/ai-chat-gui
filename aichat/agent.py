@@ -18,7 +18,7 @@ from PySide6.QtCore import QThread, Signal
 from .api import make_client
 
 MAX_ITERATIONS = 20          # 单轮用户消息最多循环次数，防止失控
-MAX_TOOL_OUTPUT = 20000      # 单个工具结果截断长度（保护上下文）
+MAX_TOOL_OUTPUT = 50_000     # 单个工具结果截断长度（1M 上下文档：够放整文件又防失控）
 BASH_TIMEOUT = 30            # bash 工具超时（秒）
 CONFIRM_TIMEOUT = 300        # 等待用户确认工具执行的超时（秒）
 CONFIRM_TOOLS = {"write", "edit", "bash"}  # 需要用户确认的工具
@@ -397,17 +397,23 @@ class AgentWorker(QThread):
             # 思考块必须排在 assistant content 数组最前
             blocks.sort(key=lambda b: 0 if b.get("type") in ("thinking",
                                                              "redacted_thinking") else 1)
+            if not blocks:
+                # 空响应（如纯空白文本流）：写入空 content 数组会让下一轮
+                # 请求被官方端点 400，直接结束本轮
+                break
             self.messages.append({"role": "assistant", "content": blocks})
 
             tool_uses = [b for b in blocks if b["type"] == "tool_use"]
             if not tool_uses or not self.agent_mode:
                 break
             if not self._running:
+                self._finish_cancelled()
                 return
 
             results = []
             for tu in tool_uses:
                 if not self._running:
+                    self._finish_cancelled()
                     return
                 args_json = json.dumps(tu.get("input") or {}, ensure_ascii=False, indent=2)
                 self.tool_call_started.emit(tu["id"], tu["name"], args_json)
@@ -439,6 +445,14 @@ class AgentWorker(QThread):
             self.history_ready.emit(list(self.messages))
 
         if not self._running:
+            self._finish_cancelled()
             return
         self.history_ready.emit(self.messages)
         self.turn_finished.emit()
+
+    def _finish_cancelled(self):
+        """取消退出前的最后回写：把已生成的（半轮）内容落盘。
+
+        GUI 侧取消时会保留一次 history_ready 通道接收它；
+        信号已断开（如退出清理）时为无害空操作。"""
+        self.history_ready.emit(list(self._completed_history()))
