@@ -1080,6 +1080,66 @@ def test_agent_worker(base, workdir):
     check("普通聊天: 文本正常流式", "".join(chunks3).startswith("我来创建文件。"))
 
 
+def test_agent_iteration_cap(workdir):
+    print("\n[2b] 迭代上限熔断：到达上限时有提示而非无声停止")
+    from aichat import agent as A
+    from aichat.agent import AgentWorker
+
+    class AlwaysToolHandler(BaseHTTPRequestHandler):
+        """无论历史如何都返回 tool_use → worker 必然耗尽 MAX_ITERATIONS"""
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            sse = anth_events([("tool_use", "t1", "read", '{"path": "x.txt"}')])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            data = sse.encode("utf-8")
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AlwaysToolHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    orig_cap = A.MAX_ITERATIONS
+    A.MAX_ITERATIONS = 2  # 压小上限加速测试（_run_loop 运行时读模块全局，补丁生效）
+    try:
+        events = {"chunks": [], "history": None, "error": None, "done": False}
+        worker = AgentWorker(
+            messages=[{"role": "user", "content": "go"}],
+            fmt="anthropic", api_key="k",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}", model="m",
+            agent_mode=True, workdir=workdir, confirm_tools=False,
+        )
+        worker.stream_chunk.connect(lambda c: events["chunks"].append(c))
+        worker.history_ready.connect(lambda h: events.update(history=h))
+        worker.turn_finished.connect(lambda: events.update(done=True))
+        worker.error_occurred.connect(lambda e: events.update(error=e))
+        worker.run()
+
+        notice = "".join(events["chunks"])
+        check("迭代上限: 流式提示到达（含轮数与继续方法）",
+              f"最大执行轮数（{A.MAX_ITERATIONS} 轮）" in notice and "继续" in notice,
+              repr(notice[-150:]))
+        history = events["history"]
+        last = history[-1] if history else {}
+        check("迭代上限: 提示写入历史尾部 assistant 消息",
+              last.get("role") == "assistant"
+              and any("最大执行轮数" in b.get("text", "") for b in last.get("content", [])
+                      if isinstance(b, dict)),
+              str(last)[:200])
+        check("迭代上限: 回合正常收尾无错误", events["done"] and events["error"] is None)
+    finally:
+        A.MAX_ITERATIONS = orig_cap
+        server.shutdown()
+
+
 def test_thinking_support(base):
     print("\n[3] 思考强度端到端（payload 注入 + 思考流解析 + 历史回传）")
     from aichat.agent import AgentWorker
@@ -2046,6 +2106,7 @@ def main():
         test_api_clients(base)
         test_api_block_start_input()
         test_agent_worker(base, workdir)
+        test_agent_iteration_cap(workdir)
         test_thinking_support(base)
         test_thinking_degrade()
         test_error_history_writeback()

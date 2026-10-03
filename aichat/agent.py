@@ -19,7 +19,7 @@ from PySide6.QtCore import QThread, Signal
 
 from .api import make_client
 
-MAX_ITERATIONS = 20          # 单轮用户消息最多循环次数，防止失控
+MAX_ITERATIONS = 40          # 单轮用户消息最多循环次数，防止失控
 MAX_TOOL_OUTPUT = 50_000     # 单个工具结果截断长度（1M 上下文档：够放整文件又防失控）
 BASH_TIMEOUT = 30            # bash 工具超时（秒）
 CONFIRM_TIMEOUT = 300        # 等待用户确认工具执行的超时（秒）
@@ -539,6 +539,7 @@ class AgentWorker(QThread):
         if self.agent_mode:
             system += AGENT_SYSTEM_SUFFIX.format(workdir=os.path.abspath(self.workdir))
 
+        hit_cap = False
         for _ in range(MAX_ITERATIONS):
             if not self._running:
                 return
@@ -605,10 +606,24 @@ class AgentWorker(QThread):
             self.messages.append({"role": "user", "content": results})
             # 每完成一轮工具回传就回写一次历史（快照）：中途失败/取消时已完成轮次不丢失
             self.history_ready.emit(list(self.messages))
+        else:
+            # for 自然耗尽（未被 break）：说明最后一轮模型仍在要求调用工具，
+            # 本回合被上限熔断。不提示的话表现为"回复戛然而止"，用户不知情
+            hit_cap = True
 
         if not self._running:
             self._finish_cancelled()
             return
+
+        if hit_cap:
+            notice = (f"\n\n---\n⚠️ 已达到单回合最大执行轮数（{MAX_ITERATIONS} 轮），"
+                      "本回合在此暂停。再发一条消息（例如“继续”）即可让 Agent 接着执行。")
+            # 流式信号：实时追加到当前回复气泡；写入历史：重载后提示仍在，
+            # 模型下回合也能看到暂停原因
+            self.stream_chunk.emit(notice)
+            self.messages.append({"role": "assistant",
+                                  "content": [{"type": "text", "text": notice}]})
+
         self.history_ready.emit(self.messages)
         self.turn_finished.emit()
 
