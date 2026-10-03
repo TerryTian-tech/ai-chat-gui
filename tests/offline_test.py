@@ -303,8 +303,6 @@ def test_stop_generation():
         check("停止: worker 自然结束后回收、进程存活",
               ok and not win._retiring_workers, f"wait={ok}")
     finally:
-        win.process_monitor.stop()
-        win.process_monitor.wait(2000)
         server.shutdown()
         shutil.rmtree(hist_dir, ignore_errors=True)
 
@@ -548,8 +546,6 @@ def test_interrupted_half_round():
                            for b in msgs[-1]["content"]))
         check("停止: 半轮正文已落盘到会话历史", partial, str(msgs)[:200])
     finally:
-        win.process_monitor.stop()
-        win.process_monitor.wait(2000)
         server.shutdown()
         shutil.rmtree(hist_dir, ignore_errors=True)
 
@@ -792,8 +788,6 @@ def test_cancel_writeback_race():
                       for b in result[2]["content"]),
               str(result)[:300])
     finally:
-        win.process_monitor.stop()
-        win.process_monitor.wait(2000)
         server.shutdown()
         shutil.rmtree(hist_dir, ignore_errors=True)
 
@@ -2026,25 +2020,21 @@ def test_ui(workdir):
 
     # 玄猫各姿态渲染 + AI 状态联动
     win.cat_widget._t = 1.2
-    for pose in ("sit", "walk", "run", "drowsy", "sleep", "stretch",
+    for pose in ("sit", "walk", "drowsy", "sleep", "stretch",
                  "think", "work", "happy", "sad"):
         win.cat_widget._enter_pose(pose, 5)
         win.cat_widget.repaint()
-    check("玄猫十种姿态渲染无崩溃", True)
+    check("玄猫九种姿态渲染无崩溃", True)
     pw = win.cat_widget
-    pw._run_flags.clear()   # 进程监控可能在本机检测到浏览器而触发奔跑，清掉保证确定性
     for state in ("thinking", "working", "happy", "sad", "idle"):
         pw.set_ai_state(state)
         pw.repaint()
     check("玄猫 AI 状态联动（thinking/working/happy/sad/idle）",
           pw._ai_state == "idle" and pw._pose == "stretch", f"{pw._ai_state}/{pw._pose}")
-    pw.set_ai_state("working")
-    pw.set_run_flag("process", True)   # AI 忙碌时进程奔跑让位
-    check("AI 忙碌时进程触发让位", pw._pose == "work", pw._pose)
-    pw.set_ai_state("idle")
-    check("AI 空闲后恢复进程奔跑", pw._pose == "run", pw._pose)
-    pw.set_run_flag("process", False)
-    check("进程结束回到平静", pw._pose == "stretch", pw._pose)
+    from aichat import pet as _pet
+    check("玄猫: 奔跑姿态及触发机制已完全移除",
+          "run" not in _pet.POSE_LABELS and not hasattr(pw, "_pose_run")
+          and not hasattr(pw, "set_run_flag") and not hasattr(pw, "_run_flags"))
 
     # 设置对话框：思考强度档位往返
     from PySide6.QtWidgets import QDialogButtonBox as _QDialogButtonBox
@@ -2082,9 +2072,6 @@ def test_ui(workdir):
         and any(b.get("type") == "thinking" and b.get("signature") == "sig1"
                 for b in m["content"])
         for c in win2.conversations.values() for m in c["messages"]))
-    for w in (win, win2):
-        w.process_monitor.stop()
-        w.process_monitor.wait(2000)
     shutil.rmtree(hist_dir, ignore_errors=True)
 
 

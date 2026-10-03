@@ -4,7 +4,6 @@ import base64
 import os
 import re
 import sys
-import threading
 import uuid
 from datetime import datetime
 from typing import Dict, List
@@ -304,116 +303,6 @@ class SettingsDialog(QDialog):
         }
 
 
-# ==================== 进程监控线程 ====================
-class ProcessMonitor(QThread):
-    """监测新启动的 Office/WPS/浏览器进程，触发桌宠奔跑"""
-    running = Signal()
-    sleeping = Signal()
-
-    OFFICE_PROCS = {'WINWORD.EXE', 'EXCEL.EXE', 'POWERPNT.EXE'}
-    WPS_PROCS = {'WPS.EXE', 'ET.EXE', 'WPP.EXE'}
-    BROWSER_PROCS = {
-        'CHROME.EXE', 'MSEDGE.EXE', 'FIREFOX.EXE',
-        '360SE.EXE', 'LIEBAO.EXE', 'SOGOUEXPLORER.EXE'
-    }
-
-    def __init__(self):
-        super().__init__()
-        self._stop_event = threading.Event()
-        self._baseline_procs = set()
-        self._baseline_browser_pids = set()
-        self._prev_new_browser_windows = False
-        self._prev_office_wps_running = False
-        self._ctypes = None
-        if sys.platform == 'win32':
-            import ctypes
-            self._ctypes = ctypes
-
-    def run(self):
-        try:
-            import psutil
-        except ImportError:
-            return  # 未安装 psutil 时静默停用进程监控
-        self._establish_baseline(psutil)
-        self._prev_new_browser_windows = False
-        self.sleeping.emit()
-        while not self._stop_event.is_set():
-            self._check(psutil)
-            self._stop_event.wait(1)
-
-    def _establish_baseline(self, psutil):
-        current = {p.info['name'].upper(): p.info.get('pid')
-                   for p in psutil.process_iter(['name', 'pid'])}
-        for name in self.OFFICE_PROCS | self.WPS_PROCS:
-            if name in current:
-                self._baseline_procs.add(name)
-        for name in self.BROWSER_PROCS:
-            if name in current:
-                self._baseline_browser_pids.add(current[name])
-
-    def _check(self, psutil):
-        try:
-            self._check_office_wps(psutil)
-            self._check_browser_windows()
-        except Exception as e:
-            print(f"进程检查异常: {e}")
-
-    def _check_office_wps(self, psutil):
-        current = {p.info['name'].upper() for p in psutil.process_iter(['name'])}
-        target = current & (self.OFFICE_PROCS | self.WPS_PROCS)
-        has_new = bool(target - self._baseline_procs)
-        if has_new and not self._prev_office_wps_running:
-            self.running.emit()
-        elif not has_new and self._prev_office_wps_running:
-            self.sleeping.emit()
-        self._prev_office_wps_running = has_new
-
-    def _check_browser_windows(self):
-        if not self._ctypes:
-            return
-        current_pids = set()
-        try:
-            import psutil
-            for proc in psutil.process_iter(['name', 'pid']):
-                if proc.info['name'].upper() in self.BROWSER_PROCS:
-                    current_pids.add(proc.info['pid'])
-        except Exception:
-            return
-        new_pids = current_pids - self._baseline_browser_pids
-        has_new = bool(new_pids) and self._browser_has_window(new_pids)
-        if has_new and not self._prev_new_browser_windows:
-            self.running.emit()
-        elif not has_new and self._prev_new_browser_windows:
-            self.sleeping.emit()
-        self._prev_new_browser_windows = has_new
-
-    def _browser_has_window(self, browser_pids):
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            found = [False]
-
-            def enum_callback(hwnd, _):
-                if not user32.IsWindowVisible(hwnd):
-                    return 1
-                pid = ctypes.c_ulong()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if pid.value in browser_pids:
-                    found[0] = True
-                    return 0
-                return 1
-
-            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-            user32.EnumWindows(EnumWindowsProc(enum_callback), None)
-            return found[0]
-        except Exception as e:
-            print(f"窗口检查异常: {e}")
-            return False
-
-    def stop(self):
-        self._stop_event.set()
-
-
 # ==================== 主窗口 ====================
 def _app_logo_icon() -> QIcon:
     """程序自身目录下的 logo.ico（打包后取 exe 所在目录，源码运行取包上层目录）；
@@ -507,13 +396,9 @@ class ChatWindow(QMainWindow):
 
         self.setup_ui()
 
-        # 桌宠玄猫 + 进程监控联动
+        # 桌宠玄猫
         self.cat_widget = CatWidget()
         self.cat_widget._main_window = self
-        self.process_monitor = ProcessMonitor()
-        self.process_monitor.running.connect(lambda: self.cat_widget.set_run_flag("process", True))
-        self.process_monitor.sleeping.connect(lambda: self.cat_widget.set_run_flag("process", False))
-        self.process_monitor.start()
 
         if not self.load_conversations():
             self.create_new_conversation()
@@ -1547,11 +1432,6 @@ class ChatWindow(QMainWindow):
         # worker 的取消回写可能晚于上面的首次保存（走的是延时保存，
         # 而事件循环即将退出），退出前再同步落盘一次
         self.save_conversations(delay=False)
-
-        if hasattr(self, 'process_monitor') and self.process_monitor.isRunning():
-            self.process_monitor.stop()
-            if not self.process_monitor.wait(3000):
-                self.process_monitor.terminate()
 
     def closeEvent(self, event):
         app = QApplication.instance()

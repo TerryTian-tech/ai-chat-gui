@@ -1,8 +1,8 @@
 """桌宠组件：一只通体乌黑、金瞳竖瞳的玄猫（半写实画风）。
 
-姿态：端坐摇尾 / 散步 / 奔跑 / 犯困点头 / 蜷睡（带 Zzz）/ 伸懒腰，
+姿态：端坐摇尾 / 散步 / 犯困点头 / 蜷睡（带 Zzz）/ 伸懒腰，
 以及与 AI 任务联动的四种姿态：思考（抬爪抵腮冒问号）/ 干活（前爪刨地）/ 开心（跳跃撒花）/ 失落（飞机耳冒汗）。
-平时按随机时长的状态机自然轮换；AI 思考、执行工具或检测到新进程时切换到对应动作。
+平时按随机时长的状态机自然轮换；AI 思考或执行工具时切换到对应动作。
 
 外形贴合玄猫真实照片：又大又圆的橙金眼 + 圆黑大瞳孔（照片里黑猫的标志性眼神）、小而圆钝的
 宽位双耳（粉灰耳内）、圆颊白须、暖黑毛色带柔光高光、由粗到细的锥形长尾；端坐与失落姿态的
@@ -44,7 +44,6 @@ SWEAT = QColor(91, 155, 213)     # 汗滴
 POSE_LABELS = {
     "sit": "端坐摇尾巴 🐈‍⬛",
     "walk": "散步中 🐾",
-    "run": "奔跑中 🐈💨",
     "drowsy": "犯困中 🥱",
     "sleep": "蜷成一团打盹 😴",
     "stretch": "伸懒腰~ 🐈",
@@ -99,7 +98,6 @@ class CatWidget(QWidget):
         self._pose_elapsed = 0.0
         self._pose_duration = 10.0
         self._cycle_index = 0
-        self._run_flags = {}         # 外部奔跑触发源（process 等）
         self._ai_state = "idle"      # AI 任务状态：idle/thinking/working/happy/sad
         self._blink_seed = random.random() * 10
 
@@ -122,7 +120,7 @@ class CatWidget(QWidget):
 
         - thinking / working：持续保持对应动作，直到下一次状态更新
         - happy / sad：播放一段庆祝/失落后自动回到平静轮换
-        - idle：回到平静轮换（若进程监控仍触发奔跑则继续奔跑）
+        - idle：回到平静轮换
         """
         self._ai_state = state
         if state == "thinking":
@@ -137,23 +135,7 @@ class CatWidget(QWidget):
             self._enter_pose("sad", 2.6)
         else:  # idle
             self._cycle_index = 0
-            if any(self._run_flags.values()):
-                self._enter_pose("run", 1e9)
-            else:
-                self._enter_pose("stretch", 1.6)
-
-    def set_run_flag(self, key: str, on: bool):
-        """外部奔跑触发源（检测到新进程等）；AI 任务动作优先，忙碌时忽略"""
-        was_running = any(self._run_flags.values())
-        self._run_flags[key] = on
-        is_running = any(self._run_flags.values())
-        if self._ai_state in ("thinking", "working", "happy", "sad"):
-            return
-        if on and not was_running:
-            self._enter_pose("run", 1e9)
-        elif not on and was_running and not is_running:
             self._enter_pose("stretch", 1.6)
-            self._cycle_index = 0
 
     # ---------- 状态机 ----------
 
@@ -171,7 +153,7 @@ class CatWidget(QWidget):
     def _tick(self):
         dt = 0.033
         self._t += dt
-        if self._pose_duration < 1e8:  # 外部触发的奔跑(超长时长)由信号退出
+        if self._pose_duration < 1e8:  # 长驻动作（思考/干活，超长时长）由状态信号退出
             self._pose_elapsed += dt
             if self._pose_elapsed >= self._pose_duration:
                 self._next_calm_pose()
@@ -581,24 +563,15 @@ class CatWidget(QWidget):
                    ear_l=-10 + tw, ear_r=12 - tw)
 
     def _pose_walk(self, p, t):
-        self._pose_run(p, t, speed=4.2, swing=0.5, bob_amp=1.2)
-
-    def _pose_run(self, p, t, speed=10.0, swing=0.85, bob_amp=2.0):
+        speed, swing, bob_amp = 4.2, 0.5, 1.2
         bob = math.sin(t * speed) * bob_amp
         wave = math.sin(t * 8) * 5
-
-        # 速度线
-        pen = QPen(QColor(160, 160, 170, 100), 1.8)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        p.drawLine(124, 56 + bob, 142, 56 + bob)
-        p.drawLine(128, 66 + bob, 144, 66 + bob)
 
         # 尾巴向后拉成流线
         self._tail(p, 108, 60 + bob, 124, 50 + bob, 136, 58 + wave, 144, 48 + wave,
                    6.5, 2.0)
 
-        # 飞奔跑 gallop：前腿向前伸、后腿向后蹬
+        # 四足交替步态：前腿向前伸、后腿向后蹬
         def leg(sx, sy, phase, fill, rear=False, L=24, width=7):
             a = math.sin(t * speed + phase) * swing
             tx = sx + (1 if rear else -1) * math.sin(a) * L
@@ -960,14 +933,11 @@ class CatWidget(QWidget):
             QMenu::item:selected { background: #edf2f7; }
         """)
         stretch_action = menu.addAction("🐈 伸个懒腰")
-        run_action = menu.addAction("💨 跑一会儿")
         menu.addSeparator()
         exit_action = menu.addAction("🐈‍⬛ 退出程序")
         action = menu.exec(event.globalPos())
         if action == stretch_action:
             self._enter_pose("stretch", 2.2)
-        elif action == run_action:
-            self._enter_pose("run", 6.0)
         elif action == exit_action:
             if hasattr(self, "_main_window") and hasattr(self._main_window, "request_real_exit"):
                 self._main_window.request_real_exit()

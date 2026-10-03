@@ -1,4 +1,3 @@
 PySide6>=6.5
 mistune>=3.0
 pygments>=2.15
-psutil>=5.9
