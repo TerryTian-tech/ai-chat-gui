@@ -12,6 +12,8 @@ import os
 import re
 import subprocess
 import threading
+import xml.etree.ElementTree as ET
+import zipfile
 
 from PySide6.QtCore import QThread, Signal
 
@@ -66,6 +68,7 @@ All tools operate relative to the working directory: {workdir} (absolute paths a
 When a task involves files, code, or commands, use tools to inspect and verify instead of guessing.
 Read only the ranges you need, keep edits surgical, and verify results after changes.
 Finish with a concise summary in the user's language; do not expose raw tool output unless asked.
+read auto-extracts text from .docx/.xlsx/.pptx files; legacy binary .doc/.xls/.ppt and other binary files cannot be read.
 """
 
 
@@ -105,12 +108,168 @@ def _read_text_file(path: str):
         return f.read(), "utf-8"
 
 
+# ==================== Office 文件文本提取 ====================
+# .docx/.xlsx/.pptx 本质是 ZIP 包内的 OOXML，用标准库 zipfile+ET 提取文本，
+# read 工具无需第三方依赖即可读 Office 文件；旧版二进制 .doc/.xls/.ppt 不支持。
+
+_NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NS_M = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _extract_docx(path: str) -> str:
+    """Word 正文：段落逐行输出，表格行渲染为 'A1 | B1'"""
+    with zipfile.ZipFile(path) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    lines = []
+
+    def para_text(p):
+        parts = []
+        for node in p.iter():
+            if node.tag == f"{{{_NS_W}}}t":
+                parts.append(node.text or "")
+            elif node.tag == f"{{{_NS_W}}}tab":
+                parts.append("\t")
+            elif node.tag in (f"{{{_NS_W}}}br", f"{{{_NS_W}}}cr"):
+                parts.append("\n")
+        return "".join(parts)
+
+    def walk(el):
+        for child in el:
+            if child.tag == f"{{{_NS_W}}}p":
+                lines.append(para_text(child))
+            elif child.tag == f"{{{_NS_W}}}tbl":
+                for tr in child.findall(f"{{{_NS_W}}}tr"):
+                    cells = ["".join(para_text(p) for p in tc.iter(f"{{{_NS_W}}}p"))
+                             for tc in tr.findall(f"{{{_NS_W}}}tc")]
+                    lines.append(" | ".join(cells))
+            else:
+                walk(child)
+
+    body = root.find(f"{{{_NS_W}}}body")
+    if body is not None:
+        walk(body)
+    return "\n".join(lines)
+
+
+def _xlsx_col_index(ref: str) -> int:
+    """单元格引用 'B3' → 列号 1（0 基）"""
+    idx = 0
+    for ch in ref:
+        if not ch.isalpha():
+            break
+        idx = idx * 26 + (ord(ch.upper()) - 64)
+    return idx - 1
+
+
+def _xlsx_cell_text(c, shared):
+    """单元格取值：共享字符串/内联字符串/布尔/公式串/数字"""
+    t = c.get("t")
+    if t == "inlineStr":
+        is_el = c.find(f"{{{_NS_M}}}is")
+        if is_el is None:
+            return ""
+        return "".join(n.text or "" for n in is_el.iter(f"{{{_NS_M}}}t"))
+    v = c.find(f"{{{_NS_M}}}v")
+    if v is None or v.text is None:
+        f_el = c.find(f"{{{_NS_M}}}f")
+        return f"={f_el.text}" if f_el is not None and f_el.text else ""
+    if t == "s":
+        try:
+            return shared[int(v.text)]
+        except (ValueError, IndexError):
+            return ""
+    if t == "b":
+        return "FALSE" if v.text in ("0", "") else "TRUE"
+    return v.text
+
+
+def _extract_xlsx(path: str) -> str:
+    """各工作表逐行输出，制表符分隔单元格；行内空列按单元格引用补位"""
+    with zipfile.ZipFile(path) as z:
+        names = set(z.namelist())
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        rel_map = {}
+        if "xl/_rels/workbook.xml.rels" in names:
+            rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+            for rel in rels.findall(f"{{{_NS_REL}}}Relationship"):
+                target = rel.get("Target", "")
+                if target.startswith("/"):
+                    target = target[1:]
+                elif not target.startswith("xl/"):
+                    target = "xl/" + target
+                rel_map[rel.get("Id")] = target
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            sst = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in sst.findall(f"{{{_NS_M}}}si"):
+                shared.append("".join(n.text or "" for n in si.iter(f"{{{_NS_M}}}t")))
+        out = []
+        for sheet in wb.iter(f"{{{_NS_M}}}sheet"):
+            target = rel_map.get(sheet.get(f"{{{_NS_R}}}id", ""))
+            if not target or target not in names:
+                continue
+            out.append(f"===== {sheet.get('name', 'sheet')} =====")
+            sh = ET.fromstring(z.read(target))
+            for row in sh.iter(f"{{{_NS_M}}}row"):
+                cells, last_col = [], -1
+                for c in row.findall(f"{{{_NS_M}}}c"):
+                    ref = c.get("r", "")
+                    col = _xlsx_col_index(ref) if ref else last_col + 1
+                    cells.extend([""] * (col - last_col - 1))
+                    cells.append(_xlsx_cell_text(c, shared))
+                    last_col = col
+                out.append("\t".join(cells))
+        return "\n".join(out)
+
+
+def _extract_pptx(path: str) -> str:
+    """幻灯片按页码数字排序，每页一节，段落逐行输出"""
+    slide_re = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
+    slides = []
+    with zipfile.ZipFile(path) as z:
+        for name in z.namelist():
+            m = slide_re.match(name)
+            if m:
+                slides.append((int(m.group(1)), name))
+        parts = []
+        for num, name in sorted(slides):
+            root = ET.fromstring(z.read(name))
+            parts.append(f"===== Slide {num} =====")
+            for p in root.iter(f"{{{_NS_A}}}p"):
+                text = "".join(n.text or "" for n in p.iter(f"{{{_NS_A}}}t"))
+                if text:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+_OFFICE_EXTRACTORS = {
+    ".docx": _extract_docx,
+    ".xlsx": _extract_xlsx,
+    ".pptx": _extract_pptx,
+}
+_LEGACY_OFFICE_EXTS = {".doc", ".xls", ".ppt"}
+
+
 def tool_read(args, workdir):
-    """读文件（带行号，支持 offset/limit 分页）"""
+    """读文件（带行号，支持 offset/limit 分页）；docx/xlsx/pptx 自动提取文本"""
     path = _resolve(workdir, args["path"])
     if not os.path.isfile(path):
         return f"error: file not found: {path}"
-    text, _enc = _read_text_file(path)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _LEGACY_OFFICE_EXTS:
+        return (f"error: {ext} 是旧版二进制格式，无法直接读取；"
+                f"请先另存为 {ext}x（如 .doc → .docx）再读")
+    extractor = _OFFICE_EXTRACTORS.get(ext)
+    if extractor is not None:
+        try:
+            text = extractor(path)
+        except Exception as e:
+            return f"error: 解析 {ext} 文件失败（文件可能损坏或不是标准 OOXML）: {e}"
+    else:
+        text, _enc = _read_text_file(path)
     lines = text.splitlines(keepends=True)
     offset = max(int(args.get("offset", 0) or 0), 0)
     limit = args.get("limit")
@@ -226,7 +385,8 @@ def tool_bash(args, workdir):
 # 工具注册表：名称 → (描述, 参数表, 实现函数)。"?" 后缀表示可选参数
 _TOOLS = {
     "read": (
-        "Read file content with line numbers (supports offset/limit pagination)",
+        "Read file content with line numbers (supports offset/limit pagination)."
+        " .docx/.xlsx/.pptx are auto-extracted to text; legacy .doc/.xls/.ppt are not supported",
         {"path": "string", "offset": "number?", "limit": "number?"},
         tool_read,
     ),

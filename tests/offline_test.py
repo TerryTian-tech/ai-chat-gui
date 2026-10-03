@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1543,6 +1544,77 @@ def test_encoding_tools(workdir):
     check("read: GBK 文件读取带行号", "第一行中文" in A.run_tool("read", {"path": "gbk.txt"}, workdir))
 
 
+def test_office_read(workdir):
+    print("\n[3.9b] read 支持 Office 文件（docx/xlsx/pptx 文本提取）")
+    from aichat import agent as A
+
+    # 手工构造最小 OOXML：只包含提取器实际读取的部件
+    docx_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:r><w:t>标题段落</w:t></w:r></w:p>
+<w:tbl>
+<w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc></w:tr>
+</w:tbl>
+<w:p><w:r><w:t>结束段落</w:t></w:r></w:p>
+</w:body></w:document>'''
+    with zipfile.ZipFile(os.path.join(workdir, "demo.docx"), "w") as z:
+        z.writestr("word/document.xml", docx_xml)
+
+    m = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    with zipfile.ZipFile(os.path.join(workdir, "demo.xlsx"), "w") as z:
+        z.writestr("xl/workbook.xml", f'''<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="{m}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="数据表" sheetId="1" r:id="rId1"/></sheets></workbook>''')
+        z.writestr("xl/_rels/workbook.xml.rels", '''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>''')
+        z.writestr("xl/sharedStrings.xml", f'''<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="{m}"><si><t>名称</t></si><si><t>值</t></si></sst>''')
+        z.writestr("xl/worksheets/sheet1.xml", f'''<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="{m}"><sheetData>
+<row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row>
+<row r="2"><c r="A2"><v>3.14</v></c><c r="B2" t="b"><v>1</v></c></row>
+<row r="3"><c r="A3" t="str"><v>=SUM(1,2)</v></c></row>
+</sheetData></worksheet>''')
+
+    a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    p = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    with zipfile.ZipFile(os.path.join(workdir, "demo.pptx"), "w") as z:
+        for num, text in ((1, "第一页标题"), (2, "第二页内容"), (10, "第十页内容")):
+            z.writestr(f"ppt/slides/slide{num}.xml", f'''<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="{p}" xmlns:a="{a}"><p:cSld><p:spTree>
+<p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sld>''')
+
+    out = A.run_tool("read", {"path": "demo.docx"}, workdir)
+    check("read: docx 段落提取", "标题段落" in out and "结束段落" in out, out)
+    check("read: docx 表格渲染为行", "A1 | B1" in out and "A2 | B2" in out, out)
+    check("read: docx 提取结果带行号", "  1| 标题段落" in out, repr(out[:80]))
+
+    out = A.run_tool("read", {"path": "demo.xlsx"}, workdir)
+    check("read: xlsx 工作表名", "===== 数据表 =====" in out, out)
+    check("read: xlsx 共享字符串与空列补位", "名称\t\t值" in out, repr(out))
+    check("read: xlsx 数字/布尔/公式串", "3.14\tTRUE" in out and "=SUM(1,2)" in out, repr(out))
+
+    out = A.run_tool("read", {"path": "demo.pptx"}, workdir)
+    check("read: pptx 按页码数字排序",
+          0 <= out.index("第一页标题") < out.index("第二页内容") < out.index("第十页内容"), out)
+
+    out = A.run_tool("read", {"path": "demo.docx", "offset": 1, "limit": 1}, workdir)
+    check("read: docx 提取结果支持分页", "A1 | B1" in out and "标题段落" not in out, out)
+
+    with open(os.path.join(workdir, "old.doc"), "wb") as f:
+        f.write(b"\xd0\xcf\x11\xe0legacy-binary")
+    out = A.run_tool("read", {"path": "old.doc"}, workdir)
+    check("read: 旧版二进制格式友好报错", out.startswith("error:") and ".docx" in out, out)
+
+    with open(os.path.join(workdir, "broken.docx"), "w", encoding="utf-8") as f:
+        f.write("not a zip file")
+    check("read: 损坏 docx 报错不崩溃", A.run_tool(
+        "read", {"path": "broken.docx"}, workdir).startswith("error:"))
+
+
 def test_responses_done_fallback():
     print("\n[3.10] Responses 网关兜底（只发 output_item.done 也能出块）")
     import urllib.request
@@ -1967,6 +2039,7 @@ def main():
         test_output_limit_clamp()
         test_context_window()
         test_encoding_tools(workdir)
+        test_office_read(workdir)
         test_responses_done_fallback()
         test_tools(workdir)
         test_normalize()
