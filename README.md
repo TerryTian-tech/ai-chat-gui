@@ -1,7 +1,7 @@
 # AI Chat GUI
 
 一款 Vibe Coding 搓出来的简易 AI 聊天窗口界面，基于 PySide6 制作，**零 SDK 依赖**（纯标准库 HTTP 客户端），
-原生支持 **Anthropic Messages** 与 **OpenAI Responses** 两种 API 格式，内置 **Agent 工具调用**，还有一只会趴睡、奔跑、犯困的可爱小狗桌宠 🐶。
+原生支持 **Anthropic Messages** 与 **OpenAI Responses** 两种 API 格式，内置 **Agent 工具调用**，还有一只通体乌黑、金瞳圆眼、会蜷睡、奔跑、犯困的可爱玄猫桌宠 🐈‍⬛。
 
 ## ✨ 功能特性
 
@@ -34,10 +34,10 @@
 - **图片上传**：PNG、JPG、JPEG、BMP、GIF、WebP，多图支持
 - **文件上传**：代码与文本文件自动包装为代码块
 
-### 🐶 小狗桌宠
-- 关闭主窗口时，一只可爱的小狗出现在桌面右下角
-- 多种自然动作：**坐着摇尾巴、散步、奔跑、犯困点头、趴睡（带 Zzz）、伸懒腰**，按随机节奏自动轮换
-- 与 AI 任务联动：发送消息后**托腮思考**（冒问号）、执行工具时**埋头刨地干活**、回答完成**跳跃庆祝**（撒星星）、出错时**垂耳冒汗**；检测到新程序启动时欢快奔跑
+### 🐈‍⬛ 玄猫桌宠
+- 关闭主窗口时，一只可爱的玄猫出现在桌面右下角
+- 多种自然动作：**端坐摇尾、散步、奔跑、犯困点头、蜷成一团打盹（带 Zzz）、伸懒腰**，按随机节奏自动轮换
+- 与 AI 任务联动：发送消息后**托腮思考**（冒问号）、执行工具时**埋头刨地干活**、回答完成**跳跃庆祝**（撒星星）、出错时**飞机耳冒汗**；检测到新程序启动时欢快奔跑
 - 可拖动到任意位置，点击恢复主窗口，右键菜单可退出
 
 ## 📦 安装部署
@@ -124,7 +124,7 @@ ai-chat-gui/
 ├── aichat/
 │   ├── api.py             # 双格式 API 客户端（urllib + SSE 流式）
 │   ├── agent.py           # 工具集 + AgentWorker agentic 循环
-│   ├── pet.py             # 小狗桌宠（多动作状态机 + QPainter 绘制）
+│   ├── pet.py             # 玄猫桌宠（多动作状态机 + QPainter 绘制）
 │   ├── widgets.py         # Markdown/消息/代码块/工具调用组件
 │   ├── window.py          # 主窗口、设置、进程监控
 │   └── app.py             # QApplication 入口
@@ -145,7 +145,7 @@ ai-chat-gui/
 1. **双格式流式**：Anthropic `content_block_delta` 与 OpenAI `response.output_text.delta` 统一为 `on_text` 回调；工具调用在流结束后以完整形态返回
 2. **消息转换**：内部 Anthropic 风格块 ↔ Responses items（`function_call` / `function_call_output` / `input_image`）双向转换
 3. **工具安全**：危险工具确认机制跨线程同步（`threading.Event`）；工具输出截断保护上下文
-4. **桌宠动画**：单计时器 30fps 驱动，参数化 QPainter 绘制十种姿态，状态机随机轮换 + AI 任务状态联动
+4. **桌宠动画**：单计时器 30fps 驱动，参数化 QPainter 绘制玄猫十种姿态（深色剪影加描边，明暗桌面均可见），状态机随机轮换 + AI 任务状态联动
 
 ## 🐛 常见问题
 

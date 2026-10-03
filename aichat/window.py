@@ -26,7 +26,7 @@ from .api import (ANTHROPIC, CONTEXT_PRESETS, FORMAT_LABELS, RESPONSES,
                   normalize_context_preset, normalize_history_message,
                   normalize_thinking_effort)
 from . import __version__ as _pkg_version
-from .pet import PuppyWidget
+from .pet import CatWidget
 from .widgets import MessageWidget
 
 APP_VERSION = f"V{_pkg_version}"
@@ -436,12 +436,12 @@ class ChatWindow(QMainWindow):
 
         self.setup_ui()
 
-        # 桌宠小狗 + 进程监控联动
-        self.puppy_widget = PuppyWidget()
-        self.puppy_widget._main_window = self
+        # 桌宠玄猫 + 进程监控联动
+        self.cat_widget = CatWidget()
+        self.cat_widget._main_window = self
         self.process_monitor = ProcessMonitor()
-        self.process_monitor.running.connect(lambda: self.puppy_widget.set_run_flag("process", True))
-        self.process_monitor.sleeping.connect(lambda: self.puppy_widget.set_run_flag("process", False))
+        self.process_monitor.running.connect(lambda: self.cat_widget.set_run_flag("process", True))
+        self.process_monitor.sleeping.connect(lambda: self.cat_widget.set_run_flag("process", False))
         self.process_monitor.start()
 
         if not self.load_conversations():
@@ -925,7 +925,7 @@ class ChatWindow(QMainWindow):
 
         self.current_ai_widget = None
         self._request_conversation_id = None
-        self.puppy_widget.set_ai_state("idle")
+        self.cat_widget.set_ai_state("idle")
 
         self.status_label.setText("● 就绪")
         self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
@@ -1135,7 +1135,7 @@ class ChatWindow(QMainWindow):
         self.status_label.setText(status_text)
         self.status_label.setStyleSheet("color: #ed8936; font-size: 14px; font-weight: 500;")
         self._set_requesting_state(True)
-        self.puppy_widget.set_ai_state("thinking")
+        self.cat_widget.set_ai_state("thinking")
 
         self.current_ai_widget = self.add_message_widget("assistant", "")
         self._request_conversation_id = self.current_conversation_id
@@ -1191,8 +1191,8 @@ class ChatWindow(QMainWindow):
     def on_tool_call_started(self, call_id: str, name: str, args_json: str):
         if self._request_stale():
             return
-        # 模型开始执行工具：小狗埋头干活
-        self.puppy_widget.set_ai_state("working")
+        # 模型开始执行工具：玄猫埋头干活
+        self.cat_widget.set_ai_state("working")
         if self.current_ai_widget:
             try:
                 self.current_ai_widget.seal_stream()
@@ -1204,8 +1204,8 @@ class ChatWindow(QMainWindow):
     def on_tool_call_finished(self, call_id: str, result: str, ok: bool):
         if self._request_stale():
             return
-        # 工具执行完毕：小狗回到思考状态（消化结果、继续下一步）
-        self.puppy_widget.set_ai_state("thinking")
+        # 工具执行完毕：玄猫回到思考状态（消化结果、继续下一步）
+        self.cat_widget.set_ai_state("thinking")
         if self.current_ai_widget:
             try:
                 self.current_ai_widget.set_tool_result(call_id, result, ok)
@@ -1268,8 +1268,8 @@ class ChatWindow(QMainWindow):
 
         self.current_ai_widget = None
         self._request_conversation_id = None
-        # 回合完成：小狗开心庆祝一下再回到平静状态
-        self.puppy_widget.set_ai_state("happy")
+        # 回合完成：玄猫开心庆祝一下再回到平静状态
+        self.cat_widget.set_ai_state("happy")
 
         self.status_label.setText("● 就绪")
         self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
@@ -1292,7 +1292,7 @@ class ChatWindow(QMainWindow):
         self.status_label.setText("● 错误")
         self.status_label.setStyleSheet("color: #f56565; font-size: 14px; font-weight: 500;")
         self._set_requesting_state(False)
-        self.puppy_widget.set_ai_state("sad")
+        self.cat_widget.set_ai_state("sad")
 
         # 仅在气泡完全无内容（正文/工具卡片/思考卡）时移除；
         # 已显示的工具调用卡片要保留——历史已回写，重新加载能看到
@@ -1452,7 +1452,7 @@ class ChatWindow(QMainWindow):
         super().changeEvent(event)
 
     def request_real_exit(self):
-        """请求真正退出程序（小狗菜单的退出项等程序化路径）"""
+        """请求真正退出程序（玄猫菜单的退出项等程序化路径）"""
         self._force_quit = True
         self.close()
 
@@ -1488,11 +1488,11 @@ class ChatWindow(QMainWindow):
     def closeEvent(self, event):
         app = QApplication.instance()
         force_quit = getattr(self, "_force_quit", False)
-        # 程序化退出（quit/小狗菜单）或系统会话结束 → 真正清理并退出；
-        # 用户点击标题栏关闭（spontaneous）→ 最小化为桌宠小狗
+        # 程序化退出（quit/玄猫菜单）或系统会话结束 → 真正清理并退出；
+        # 用户点击标题栏关闭（spontaneous）→ 最小化为桌宠玄猫
         if force_quit or app.isSavingSession() or not event.spontaneous():
-            if hasattr(self, 'puppy_widget') and self.puppy_widget.isVisible():
-                self.puppy_widget.hide()
+            if hasattr(self, 'cat_widget') and self.cat_widget.isVisible():
+                self.cat_widget.hide()
             self._do_exit_cleanup()
             event.accept()
             # 主窗口此时通常是隐藏状态（已最小化为桌宠），close() 一个隐藏窗口
@@ -1500,7 +1500,7 @@ class ChatWindow(QMainWindow):
             QApplication.quit()
             return
 
-        if hasattr(self, 'puppy_widget'):
+        if hasattr(self, 'cat_widget'):
             self.hide()
-            self.puppy_widget.show_at_bottom_right()
+            self.cat_widget.show_at_bottom_right()
         event.ignore()

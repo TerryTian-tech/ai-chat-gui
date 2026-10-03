@@ -1713,7 +1713,7 @@ def test_api_block_start_input():
 
 
 def test_ui(workdir):
-    print("\n[6] UI 离屏冒烟测试（主窗口 + 小狗 + 消息组件）")
+    print("\n[6] UI 离屏冒烟测试（主窗口 + 玄猫 + 消息组件）")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
@@ -1854,7 +1854,7 @@ def test_ui(workdir):
           str([b.toPlainText() for b in wm._all_text_browsers]))
 
     # 桌宠隐藏时暂停 30fps 动画定时器，显示时恢复；初始不可见不空转
-    pw = win.puppy_widget
+    pw = win.cat_widget
     check("桌宠: 初始不可见时定时器不空转", not pw._timer.isActive())
     pw.show()
     pw.hide()
@@ -1887,19 +1887,19 @@ def test_ui(workdir):
     win.supports_vision = False
     check("视觉检测: gpt-5 不再误报", win._check_model_supports_vision())
 
-    # 小狗各姿态渲染 + AI 状态联动
-    win.puppy_widget._t = 1.2
+    # 玄猫各姿态渲染 + AI 状态联动
+    win.cat_widget._t = 1.2
     for pose in ("sit", "walk", "run", "drowsy", "sleep", "stretch",
                  "think", "work", "happy", "sad"):
-        win.puppy_widget._enter_pose(pose, 5)
-        win.puppy_widget.repaint()
-    check("小狗十种姿态渲染无崩溃", True)
-    pw = win.puppy_widget
+        win.cat_widget._enter_pose(pose, 5)
+        win.cat_widget.repaint()
+    check("玄猫十种姿态渲染无崩溃", True)
+    pw = win.cat_widget
     pw._run_flags.clear()   # 进程监控可能在本机检测到浏览器而触发奔跑，清掉保证确定性
     for state in ("thinking", "working", "happy", "sad", "idle"):
         pw.set_ai_state(state)
         pw.repaint()
-    check("小狗 AI 状态联动（thinking/working/happy/sad/idle）",
+    check("玄猫 AI 状态联动（thinking/working/happy/sad/idle）",
           pw._ai_state == "idle" and pw._pose == "stretch", f"{pw._ai_state}/{pw._pose}")
     pw.set_ai_state("working")
     pw.set_run_flag("process", True)   # AI 忙碌时进程奔跑让位
