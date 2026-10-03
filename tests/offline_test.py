@@ -1982,8 +1982,17 @@ def test_ui(workdir):
     check("进程结束回到平静", pw._pose == "stretch", pw._pose)
 
     # 设置对话框：思考强度档位往返
+    from PySide6.QtWidgets import QDialogButtonBox as _QDialogButtonBox
     from aichat.window import SettingsDialog
     dlg = SettingsDialog()
+    # 滚动区回归：窗口被压矮时保存按钮仍固定在底部可视范围内（不再被挤出窗口）
+    dlg.resize(520, 360)
+    dlg.show()
+    app.processEvents()
+    _ok_btn = dlg.findChild(_QDialogButtonBox).button(_QDialogButtonBox.StandardButton.Ok)
+    _ok_y = _ok_btn.mapTo(dlg, _ok_btn.rect().topLeft()).y()
+    check("设置对话框: 矮窗口下保存按钮在可视区内",
+          0 < _ok_y < dlg.height(), f"ok_y={_ok_y}, dlg_h={dlg.height()}")
     check("设置对话框: 思考强度下拉含 4 档", dlg.thinking_combo.count() == 4)
     dlg.thinking_combo.setCurrentIndex(3)
     check("设置对话框: get_settings 携带 thinking_effort",

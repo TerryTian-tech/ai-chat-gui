@@ -70,9 +70,31 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.resize(520, 560)
+        self.resize(520, 620)
+        # 屏幕较矮时收紧窗口高度，配合下方滚动区保证保存按钮始终可见
+        avail_h = self.screen().availableGeometry().height()
+        if self.height() > avail_h - 80:
+            self.resize(520, max(360, avail_h - 80))
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # 设置项整体放进滚动区：内容再高按钮栏也固定在底部
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }
+            QScrollBar:vertical { background: #edf2f7; width: 8px; border-radius: 4px; }
+            QScrollBar::handle:vertical { background: #cbd5e0; border-radius: 4px; min-height: 30px; }
+            QScrollBar::handle:vertical:hover { background: #a0aec0; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+        outer.addWidget(scroll, 1)
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setSpacing(14)
         layout.setContentsMargins(24, 24, 24, 24)
 
@@ -177,7 +199,7 @@ class SettingsDialog(QDialog):
             "color: #718096; font-size: 12px; padding: 12px; background: #edf2f7; "
             "border-radius: 10px; line-height: 1.6;")
         help_label.setWordWrap(True)
-        layout.addWidget(help_label, 1)
+        layout.addWidget(help_label)
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -202,7 +224,11 @@ class SettingsDialog(QDialog):
             QPushButton#cancelButton { background: white; color: #4a5568; border: 1px solid #e2e8f0; }
             QPushButton#cancelButton:hover { background: #f7fafc; }
         """)
-        layout.addWidget(button_box)
+        footer = QWidget()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(24, 8, 24, 20)
+        footer_layout.addWidget(button_box)
+        outer.addWidget(footer)
 
         self.setStyleSheet("""
             QDialog { background-color: #f9fafc; }
