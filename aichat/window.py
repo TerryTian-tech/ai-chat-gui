@@ -10,8 +10,10 @@ from datetime import datetime
 from typing import Dict, List
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QBuffer, QByteArray, QEvent, QSettings, Signal, Qt, QThread, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtCore import (QBuffer, QByteArray, QEvent, QPointF, QSettings, Signal,
+                            Qt, QThread, QTimer)
+from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QImage, QLinearGradient,
+                           QPainter, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
@@ -30,6 +32,34 @@ from .pet import CatWidget
 from .widgets import MessageWidget
 
 APP_VERSION = f"V{_pkg_version}"
+
+
+# ==================== 主窗口背景层 ====================
+class GlassBackdrop(QWidget):
+    """主窗口背景：柔和渐变底 + 彩色光斑（径向渐变天然软边，等效预模糊），
+    供左侧半透明磨玻璃面板透出，形成玻璃拟态层次。光斑集中在左侧栏区域。"""
+
+    _BLOBS = [  # (相对x, 相对y, 半径px, 颜色)
+        (0.08, 0.15, 320, QColor(102, 126, 234, 120)),
+        (0.02, 0.60, 280, QColor(79, 209, 197, 95)),
+        (0.24, 0.94, 300, QColor(246, 135, 179, 90)),
+        (0.46, 0.38, 360, QColor(118, 75, 162, 50)),
+    ]
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        base = QLinearGradient(0, 0, self.width(), self.height())
+        base.setColorAt(0.0, QColor("#f7fafc"))
+        base.setColorAt(1.0, QColor("#eef1fb"))
+        painter.fillRect(self.rect(), base)
+        painter.setPen(Qt.NoPen)
+        w, h = self.width(), self.height()
+        for rx, ry, r, color in self._BLOBS:
+            grad = QRadialGradient(rx * w, ry * h, r)
+            grad.setColorAt(0.0, color)
+            grad.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
+            painter.setBrush(QBrush(grad))
+            painter.drawEllipse(QPointF(rx * w, ry * h), r, r)
 
 
 # ==================== 设置对话框 ====================
@@ -459,7 +489,7 @@ class ChatWindow(QMainWindow):
             QListWidget { outline: none; }
         """)
 
-        central_widget = QWidget()
+        central_widget = GlassBackdrop()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -470,10 +500,17 @@ class ChatWindow(QMainWindow):
         splitter.setStyleSheet("QSplitter::handle { background: #e2e8f0; }")
         main_layout.addWidget(splitter)
 
-        # 左侧面板
+        # 左侧面板：半透明磨玻璃（背景为 GlassBackdrop 渐变+光斑，白色半透明覆盖其上）
         left_widget = QWidget()
+        left_widget.setObjectName("leftPanel")
         left_widget.setFixedWidth(280)
-        left_widget.setStyleSheet("background: #1a202c;")
+        left_widget.setStyleSheet("""
+            #leftPanel {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(255, 255, 255, 0.72), stop:1 rgba(255, 255, 255, 0.48));
+                border-right: 1px solid rgba(255, 255, 255, 0.8);
+            }
+        """)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(16, 24, 16, 24)
         left_layout.setSpacing(16)
@@ -483,7 +520,7 @@ class ChatWindow(QMainWindow):
         logo_label.setStyleSheet("font-size: 32px; background: transparent;")
         header.addWidget(logo_label)
         title_label = QLabel("AI Chat")
-        title_label.setStyleSheet("color: white; font-size: 24px; font-weight: 600; background: transparent;")
+        title_label.setStyleSheet("color: #2d3748; font-size: 24px; font-weight: 600; background: transparent;")
         header.addWidget(title_label)
         header.addStretch()
         left_layout.addLayout(header)
@@ -493,26 +530,29 @@ class ChatWindow(QMainWindow):
         new_conv_btn.clicked.connect(self.create_new_conversation)
         new_conv_btn.setStyleSheet("""
             QPushButton {
-                background: #2d3748; color: #e2e8f0;
-                border: 2px dashed #4a5568; border-radius: 16px;
+                background: rgba(255, 255, 255, 0.55); color: #4a5568;
+                border: 2px dashed rgba(102, 126, 234, 0.55); border-radius: 16px;
                 padding: 14px; font-size: 16px; font-weight: 600;
             }
-            QPushButton:hover { background: #3d4758; border-color: #718096; color: white; }
-            QPushButton:pressed { background: #1e2a3a; }
+            QPushButton:hover { background: rgba(255, 255, 255, 0.9); border-color: #667eea; }
+            QPushButton:pressed { background: rgba(102, 126, 234, 0.15); }
         """)
         left_layout.addWidget(new_conv_btn)
 
         list_label = QLabel("对话历史")
         list_label.setStyleSheet(
-            "color: #a0aec0; font-size: 12px; margin-top: 8px; background: transparent; letter-spacing: 0.5px;")
+            "color: #718096; font-size: 12px; margin-top: 8px; background: transparent; letter-spacing: 0.5px;")
         left_layout.addWidget(list_label)
 
         self.conversation_list = QListWidget()
         self.conversation_list.setStyleSheet("""
             QListWidget { background: transparent; border: none; outline: none; font-size: 14px; }
-            QListWidget::item { color: #e2e8f0; padding: 14px 16px; border-radius: 12px; margin: 2px 0; }
-            QListWidget::item:hover { background: #2d3748; }
-            QListWidget::item:selected { background: #4a5568; color: white; }
+            QListWidget::item { color: #2d3748; padding: 14px 16px; border-radius: 12px; margin: 2px 0; }
+            QListWidget::item:hover { background: rgba(255, 255, 255, 0.75); }
+            QListWidget::item:selected {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #667eea, stop:1 #764ba2);
+                color: white;
+            }
         """)
         self.conversation_list.currentItemChanged.connect(self.on_conversation_changed)
         self.conversation_list.itemDoubleClicked.connect(self.rename_conversation)
@@ -524,8 +564,8 @@ class ChatWindow(QMainWindow):
         settings_btn.setCursor(Qt.PointingHandCursor)
         settings_btn.clicked.connect(self.open_settings)
         settings_btn.setStyleSheet("""
-            QPushButton { background: #2d3748; color: #a0aec0; border: none; border-radius: 12px; padding: 14px; font-size: 15px; }
-            QPushButton:hover { background: #3d4758; color: white; }
+            QPushButton { background: rgba(255, 255, 255, 0.5); color: #4a5568; border: none; border-radius: 12px; padding: 14px; font-size: 15px; }
+            QPushButton:hover { background: rgba(255, 255, 255, 0.85); color: #2d3748; }
         """)
         left_layout.addWidget(settings_btn)
 
@@ -533,8 +573,9 @@ class ChatWindow(QMainWindow):
         clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.clicked.connect(self.clear_all_history)
         clear_btn.setStyleSheet("""
-            QPushButton { background: #2d3748; color: #a0aec0; border: none; border-radius: 12px; padding: 14px; font-size: 15px; }
-            QPushButton:hover { background: #c53030; color: white; }
+            QPushButton { background: rgba(255, 255, 255, 0.5); color: #4a5568; border: none; border-radius: 12px; padding: 14px; font-size: 15px; }
+            QPushButton:hover { background: #f56565; color: white; }
+            QPushButton:pressed { background: #c53030; }
         """)
         left_layout.addWidget(clear_btn)
 
@@ -547,20 +588,7 @@ class ChatWindow(QMainWindow):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
-        header_bar = QFrame()
-        header_bar.setFixedHeight(70)
-        header_bar.setStyleSheet("background: white; border-bottom: 1px solid #e2e8f0;")
-        header_layout = QHBoxLayout(header_bar)
-        header_layout.setContentsMargins(28, 0, 28, 0)
-        self.conversation_title = QLabel("新对话")
-        self.conversation_title.setStyleSheet("font-size: 20px; font-weight: 600; color: #1a202c;")
-        header_layout.addWidget(self.conversation_title)
-        header_layout.addStretch()
-        self.status_label = QLabel("● 就绪")
-        self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
-        header_layout.addWidget(self.status_label)
-        right_layout.addWidget(header_bar)
-
+        # 会话标题只在左侧历史列表中展示，顶部不再重复；状态标签位于底部提示行
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("QScrollArea { border: none; background: #f9fafc; }")
@@ -649,9 +677,17 @@ class ChatWindow(QMainWindow):
 
         input_layout.addWidget(input_frame)
 
+        # 底部提示行：状态标签（就绪/思考中/错误）+ 免责声明
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        self.status_label = QLabel("● 就绪")
+        self.status_label.setStyleSheet("color: #48bb78; font-size: 13px; font-weight: 500;")
+        hint_row.addWidget(self.status_label)
+        hint_row.addStretch()
         hint_label = QLabel("AI 生成内容仅供参考。支持文本/图片上传；Agent 模式下可自动读写文件、执行命令。")
-        hint_label.setStyleSheet("color: #a0aec0; font-size: 12px; padding-left: 8px; margin: 0;")
-        input_layout.addWidget(hint_label)
+        hint_label.setStyleSheet("color: #a0aec0; font-size: 12px;")
+        hint_row.addWidget(hint_label)
+        input_layout.addLayout(hint_row)
 
         right_layout.addWidget(input_container)
         splitter.addWidget(right_widget)
@@ -928,7 +964,7 @@ class ChatWindow(QMainWindow):
         self.cat_widget.set_ai_state("idle")
 
         self.status_label.setText("● 就绪")
-        self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
+        self.status_label.setStyleSheet("color: #48bb78; font-size: 13px; font-weight: 500;")
         self._set_requesting_state(False)
 
     def _on_cancelled_history(self, cid, messages, seq=None):
@@ -957,7 +993,6 @@ class ChatWindow(QMainWindow):
         self.conversation_list.insertItem(0, item)
         self.conversation_list.setCurrentItem(item)
         self.current_conversation_id = conv_id
-        self.update_conversation_title()
         self.save_conversations()
 
     def on_conversation_changed(self, current, previous):
@@ -965,12 +1000,7 @@ class ChatWindow(QMainWindow):
             self._cancel_current_request()
             conv_id = current.data(Qt.ItemDataRole.UserRole)
             self.current_conversation_id = conv_id
-            self.update_conversation_title()
             self.load_conversation_messages()
-
-    def update_conversation_title(self):
-        if self.current_conversation_id and self.current_conversation_id in self.conversations:
-            self.conversation_title.setText(self.conversations[self.current_conversation_id]['title'])
 
     def load_conversation_messages(self):
         self.clear_messages()
@@ -1128,12 +1158,11 @@ class ChatWindow(QMainWindow):
         if len(conversation['messages']) == 1:
             new_title = display_text[:20] + ('...' if len(display_text) > 20 else '')
             conversation['title'] = new_title
-            self.update_conversation_title()
             self.conversation_list.currentItem().setText(f"💬 {new_title}")
 
         status_text = "● Agent 工作中..." if self.agent_mode else "● AI 正在思考..."
         self.status_label.setText(status_text)
-        self.status_label.setStyleSheet("color: #ed8936; font-size: 14px; font-weight: 500;")
+        self.status_label.setStyleSheet("color: #ed8936; font-size: 13px; font-weight: 500;")
         self._set_requesting_state(True)
         self.cat_widget.set_ai_state("thinking")
 
@@ -1272,7 +1301,7 @@ class ChatWindow(QMainWindow):
         self.cat_widget.set_ai_state("happy")
 
         self.status_label.setText("● 就绪")
-        self.status_label.setStyleSheet("color: #48bb78; font-size: 14px; font-weight: 500;")
+        self.status_label.setStyleSheet("color: #48bb78; font-size: 13px; font-weight: 500;")
         self._set_requesting_state(False)
         self.save_conversations()
 
@@ -1290,7 +1319,7 @@ class ChatWindow(QMainWindow):
 
         QMessageBox.critical(self, "API错误", f"请求失败：{error_msg}")
         self.status_label.setText("● 错误")
-        self.status_label.setStyleSheet("color: #f56565; font-size: 14px; font-weight: 500;")
+        self.status_label.setStyleSheet("color: #f56565; font-size: 13px; font-weight: 500;")
         self._set_requesting_state(False)
         self.cat_widget.set_ai_state("sad")
 
@@ -1424,8 +1453,6 @@ class ChatWindow(QMainWindow):
         if ok and new_title.strip():
             self.conversations[conv_id]['title'] = new_title.strip()
             item.setText(f"💬 {new_title.strip()}")
-            if conv_id == self.current_conversation_id:
-                self.update_conversation_title()
             self.save_conversations()
 
     def delete_conversation(self, item):
