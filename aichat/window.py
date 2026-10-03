@@ -415,6 +415,17 @@ class ProcessMonitor(QThread):
 
 
 # ==================== 主窗口 ====================
+def _app_logo_icon() -> QIcon:
+    """程序自身目录下的 logo.ico（打包后取 exe 所在目录，源码运行取包上层目录）；
+    文件不存在或无法解析时返回空 QIcon，由调用方回退到现画图标。"""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    icon = QIcon(os.path.join(base, "logo.ico"))
+    return icon
+
+
 class ChatWindow(QMainWindow):
     HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".aichat")
     HISTORY_FILE = os.path.join(HISTORY_DIR, "conversations.json")
@@ -477,18 +488,22 @@ class ChatWindow(QMainWindow):
         self.agent_mode = settings.value("agent_mode", False, type=bool)
         self.settings = settings
 
-        icon_pixmap = QPixmap(32, 32)
-        icon_pixmap.fill(Qt.transparent)
-        painter = QPainter(icon_pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor(102, 126, 234))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(0, 0, 32, 32, 8, 8)
-        painter.setPen(QColor(255, 255, 255))
-        painter.setFont(QFont("Arial", 18, QFont.Bold))
-        painter.drawText(icon_pixmap.rect(), Qt.AlignCenter, "AI")
-        painter.end()
-        self.setWindowIcon(QIcon(icon_pixmap))
+        logo_icon = _app_logo_icon()
+        if not logo_icon.isNull():
+            self.setWindowIcon(logo_icon)
+        else:
+            icon_pixmap = QPixmap(32, 32)
+            icon_pixmap.fill(Qt.transparent)
+            painter = QPainter(icon_pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setBrush(QColor(102, 126, 234))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(0, 0, 32, 32, 8, 8)
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Arial", 18, QFont.Bold))
+            painter.drawText(icon_pixmap.rect(), Qt.AlignCenter, "AI")
+            painter.end()
+            self.setWindowIcon(QIcon(icon_pixmap))
 
         self.setup_ui()
 

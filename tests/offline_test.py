@@ -1800,6 +1800,11 @@ def test_ui(workdir):
     win.resize(1200, 800)
     check("主窗口创建成功", win.current_conversation_id is not None)
 
+    # 窗口图标：优先读取程序自身目录下的 logo.ico
+    from aichat.window import _app_logo_icon
+    check("窗口图标: 程序目录 logo.ico 可加载且已应用",
+          not _app_logo_icon().isNull() and not win.windowIcon().isNull())
+
     # 模拟一轮 agent 对话的历史渲染
     conv = win.conversations[win.current_conversation_id]
     conv["messages"] = [
